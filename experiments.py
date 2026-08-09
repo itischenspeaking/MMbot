@@ -3,7 +3,7 @@
 import numpy as np
 
 from market import RandomWalk
-from simulator import PoissonFlow, run
+from simulator import BernoulliFlow, run
 from strategy import NaiveMaker
 
 
@@ -14,7 +14,7 @@ def sweep(n_seeds=500, n_steps=2000, sigma=0.1, half_spread=0.5, trade_prob=0.3)
         r = run(
             RandomWalk(sigma=sigma),
             NaiveMaker(half_spread=half_spread),
-            PoissonFlow(trade_prob=trade_prob),
+            BernoulliFlow(trade_prob=trade_prob),
             n_steps=n_steps,
             seed=s,
         )

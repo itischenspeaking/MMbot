@@ -13,6 +13,8 @@ class NaiveMaker:
     """Quote S +/- h. Ignores inventory, ignores everything."""
 
     def __init__(self, half_spread=0.5):
+        if half_spread <= 0:
+            raise ValueError("half_spread must be positive")
         self.half_spread = half_spread
 
     def quote(self, S, inventory):
