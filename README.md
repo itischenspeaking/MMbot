@@ -1,27 +1,34 @@
 # MMbot
 
-A market-making bot built up in versions, each one fixing a specific
-failure of the last.
+A minimal market-making simulator, built to run experiments on. Each version
+adds one mechanism and the log records what changed and why the previous
+version needed it.
 
-## Versions
+## Layout
 
-**v0** — quotes S ± h regardless of anything. Fills arrive at random and
-don't depend on the quote.
+    market.py       the true price
+    strategy.py     how the maker quotes
+    simulator.py    order flow, account, the loop
+    experiments.py  sweeps
 
-Over 500 runs of 2000 steps (σ=0.1, h=0.5, fill prob 0.3):
-
-    spread pnl      mean  299.4    std  10.6
-    inventory pnl   mean   -1.3    std  78.6
-    total           mean  298.1    std  79.3
-
-Inventory contributes no expected return and 98% of the variance. It
-random walks — nothing in v0 pulls it back to zero.
-
-Both spread income and inventory risk scale linearly in n, so mean/std is
-3.76 and stays there however long the bot runs. Inventory control isn't an
-optimisation; without it the business doesn't compound.
+Market and flow draw from separate seed streams, so two runs differing only in
+a strategy parameter face the same price path.
 
 ## Running
 
     pip install -r requirements.txt
-    python V0.py
+    python test_invariants.py
+    python experiments.py
+
+Edit the calls at the bottom of `experiments.py` to change what gets swept.
+
+## Versions
+
+**v0** — quotes S ± h and ignores everything else. Fills arrive at random and
+don't depend on the quote. Spread income is nearly deterministic; inventory
+random walks, earns nothing, and carries 98% of the variance. Both scale
+linearly in time, so risk-adjusted return doesn't improve however long the bot
+runs. [Log](v0_log.md)
+
+**v1** — in progress. Fill intensity decays with quote distance, so width
+starts to cost volume.
