@@ -36,5 +36,17 @@ half-spread appears at h* = 1/kappa, recovered by Monte Carlo across kappa; flow
 intensity A scales P&L without moving the optimum. The risk-adjusted best sits
 wider than the mean-P&L best. [Log](v1_log.md)
 
-**v2** — in progress. Quotes skew with inventory to pull the position back to
-flat, which only works now that flow responds to the quote.
+**v2** — the quote center shifts against inventory, center = S − k·q, which
+only works now that flow responds to the quote (v0's flow couldn't feel it).
+RMS inventory falls steeply and cheaply at first — one small k cuts it 57% for
+a 0.4% P&L cost — with diminishing inventory returns and rising P&L cost as k
+grows further. RMS inventory at fixed k is exactly independent of sigma, as
+the model predicts; the best observed mean/std region shifts toward stronger
+skew as sigma rises. At sigma = 0, where inventory carries no price risk at
+all, mean/std still peaks at positive k — traced by exact P&L attribution to a
+negative correlation skew induces between baseline fill income and its own
+correction, not to any inventory-price effect. [Log](v2_log.md)
+
+**v3** — in progress. Order flow so far is uninformed; v3 introduces flow that
+carries information about future fair value and asks whether the maker should
+update its quoting on that, not just on inventory.
