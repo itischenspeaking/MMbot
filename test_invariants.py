@@ -6,9 +6,8 @@
 import numpy as np
 
 from market import RandomWalk
-from simulator import Account, BernoulliFlow, run
+from simulator import Account, BernoulliFlow, QuoteSensitiveFlow, run
 from strategy import NaiveMaker
-
 
 def base(**kw):
     return run(
@@ -76,6 +75,18 @@ def test_bad_params_raise():
         except ValueError:
             continue
         raise AssertionError("expected ValueError")
+
+
+def test_skew_zero_recovers_naive():
+    """InventorySkewMaker(k=0) must be byte-identical to NaiveMaker
+    under the flow we actually use in v2."""
+    from strategy import InventorySkewMaker
+    kw = dict(n_steps=500, seed=7)
+    flow = lambda: QuoteSensitiveFlow(A=0.4, kappa=1.0)
+    a = run(RandomWalk(), NaiveMaker(half_spread=1.0), flow(), **kw)
+    b = run(RandomWalk(), InventorySkewMaker(half_spread=1.0, k=0.0), flow(), **kw)
+    for key in ("S", "bid", "ask", "inventory", "pnl"):
+        assert np.array_equal(a[key], b[key]), key
 
 
 if __name__ == "__main__":
