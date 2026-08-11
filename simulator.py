@@ -47,6 +47,49 @@ class BernoulliFlow:
         return (True, False) if u_side < 0.5 else (False, True)
 
 
+class QuoteSensitiveFlow:
+    """Fill probability decays with how far the quote sits from fair value.
+
+    p_fill(delta) = min(1, A * exp(-kappa * delta))
+
+    where delta is the distance from the true price S to that side's quote.
+    Quoting wider now costs volume, which is the whole point of v1: it makes
+    an optimal spread exist. The two sides are drawn independently, so in one
+    step we can fill both, one, or neither — this is separate buy and sell
+    customer flow, not a single trader picking a side (that was v0).
+
+      A     one-sided fill prob when quoting exactly at S (delta = 0)
+      kappa how fast that prob decays as the quote moves away; larger = steeper
+    """
+
+    def __init__(self, A, kappa):
+        # These are experiment knobs, so validate them here, once. The prices
+        # passed to fills() come from our own market/strategy and are trusted;
+        # we don't re-check them on the hot path.
+        if not 0.0 < A <= 1.0:
+            raise ValueError("A must be in (0, 1]")
+        if kappa <= 0.0:
+            raise ValueError("kappa must be positive")
+        self.A = A
+        self.kappa = kappa
+        self._log_A = np.log(A)  # precomputed so the hot path avoids a log()
+
+    def _p_fill(self, delta):
+        # Work in log space: A*exp(-kappa*delta) overflows to inf when delta
+        # is very negative (a quote through fair value, which v2's skew can
+        # produce). log_p >= 0 means the raw prob is >= 1, so cap at 1.
+        log_p = self._log_A - self.kappa * delta
+        return 1.0 if log_p >= 0.0 else np.exp(log_p)
+
+    def fills(self, S, bid, ask, rng):
+        # Exactly two draws every call, unconditionally, so that changing A or
+        # kappa leaves the price path and draw alignment untouched across runs.
+        u_bid, u_ask = rng.random(2)
+        hit = u_bid < self._p_fill(S - bid)   # someone sells to us at our bid
+        lift = u_ask < self._p_fill(ask - S)  # someone buys from us at our ask
+        return hit, lift
+
+
 class Account:
     def __init__(self):
         self.cash = 0.0
