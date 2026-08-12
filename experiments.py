@@ -3,8 +3,9 @@
 import numpy as np
 
 from market import RandomWalk
-from simulator import BernoulliFlow, QuoteSensitiveFlow, InformedFlow, run
-from strategy import NaiveMaker, InventorySkewMaker
+from simulator import (BernoulliFlow, QuoteSensitiveFlow, InformedFlow,
+                       RegimeInformedFlow, step_schedule, run)
+from strategy import NaiveMaker, InventorySkewMaker, RollingToxicityEstimator
 
 
 def sweep(n_seeds=500, n_steps=2000, sigma=0.1, half_spread=0.5, trade_prob=0.3):
@@ -307,7 +308,154 @@ def stage0_spread_mismatch_diag(n_seeds=1000, n_steps=1000, sigma=0.1,
           f"se={se:.3f}  t={diff.mean() / se:.2f}")
 
 
-if __name__ == "__main__":
-    stage0_effect_size(sigma=0.3)
+# --------------- v3b Stage 2: offline toxicity estimation ---------------
+#
+# Fixed maker (h=1, k=0), primary regime schedule, sigma=0.3. The estimator
+# is pure offline post-processing on the run() log — it never touches quotes.
+
+def _v3b_primary_run(seed, sigma=0.3, seg_len=1500):
+    """One run under the locked primary schedule with a fixed h=1, k=0 maker."""
+    n_steps = 3 * seg_len
+    schedule = step_schedule(n_steps, [seg_len, 2 * seg_len], [0.0, 1.0, 0.0])
+    r = run(RandomWalk(sigma=sigma),
+            InventorySkewMaker(half_spread=1.0, k=0.0),
+            RegimeInformedFlow(A=0.4, kappa=1.0, phi_schedule=schedule),
+            n_steps=n_steps, seed=seed)
+    return r, schedule
+
+
+def stage2_metrics(Ns=(20, 50, 100), n_seeds=300, sigma=0.3, seg_len=1500):
+    """Summary table: steady-state bias/RMSE/noise and response lag per N.
+
+    Steady state within a regime = ticks where the window holds only
+    same-regime fills, i.e. from the tick at which N fills have accumulated
+    since the latest boundary, to the next boundary. Transition periods are
+    excluded from steady-state metrics by construction.
+    """
+    n_steps = 3 * seg_len
+    bounds = [0, seg_len, 2 * seg_len, n_steps]
+    seg_phi = [0.0, 1.0, 0.0]
+    seg_name = ["low", "high", "low"]
+
+    print(f"sigma={sigma}, seg_len={seg_len}, n_seeds={n_seeds}")
+    print(f"  {'N':>4} {'regime':>7} {'mean_phi':>9} {'bias':>8} "
+          f"{'rmse':>8} {'noise':>8}")
+
+    lag_up = {N: [] for N in Ns}    # fills after 0->1 boundary until phi_hat>=0.5
+    lag_down = {N: [] for N in Ns}  # fills after 1->0 boundary until phi_hat<=0.5
+    # Seeds where phi_hat already sits on the wrong side of 0.5 at the boundary
+    # tick are excluded from lag (they'd register a spurious ~0 lag) and
+    # counted here instead, as a pre-boundary misclassification rate.
+    false_up = {N: 0 for N in Ns}    # phi_hat >= 0.5 already, just before 0->1
+    false_down = {N: 0 for N in Ns}  # phi_hat <= 0.5 already, just before 1->0
+    n_valid = {N: 0 for N in Ns}     # seeds with a defined phi_hat at boundary
+
+    for N in Ns:
+        ss = {0: [], 1: [], 2: []}  # steady-state phi_hat samples per regime
+        for seed in range(n_seeds):
+            r, _ = _v3b_primary_run(seed, sigma=sigma, seg_len=seg_len)
+            sf, ds = r["signed_flow"], r["delta_S"]
+            phi_hat = RollingToxicityEstimator(N, sigma).run_offline(sf, ds)
+
+            # steady-state samples: per segment, skip until N fills in-regime
+            for i in range(3):
+                lo, hi = bounds[i], bounds[i + 1]
+                fills_seen, ss_start = 0, None
+                for t in range(lo, hi):
+                    if sf[t] != 0:
+                        fills_seen += 1
+                        if fills_seen >= N:
+                            ss_start = t + 1
+                            break
+                if ss_start is not None:
+                    seg = phi_hat[ss_start:hi]
+                    seg = seg[~np.isnan(seg)]
+                    if len(seg):
+                        ss[i].append(seg)
+
+            # response lag: new fills after each boundary until the 0.5 cross.
+            # Skip seeds already on the wrong side at the boundary (they'd
+            # log a spurious ~0 lag); count them as pre-boundary false-side.
+            b = seg_len  # 0 -> 1
+            pre = phi_hat[b - 1]
+            if not np.isnan(pre):
+                n_valid[N] += 1
+                if pre >= 0.5:
+                    false_up[N] += 1  # already high before the jump
+                else:
+                    fills_after, crossed = 0, None
+                    for t in range(b, bounds[2]):
+                        if sf[t] != 0:
+                            fills_after += 1
+                        if not np.isnan(phi_hat[t]) and phi_hat[t] >= 0.5:
+                            crossed = fills_after
+                            break
+                    if crossed is not None:
+                        lag_up[N].append(crossed)
+
+            b = 2 * seg_len  # 1 -> 0
+            pre = phi_hat[b - 1]
+            if not np.isnan(pre):
+                if pre <= 0.5:
+                    false_down[N] += 1  # already low before the drop
+                else:
+                    fills_after, crossed = 0, None
+                    for t in range(b, bounds[3]):
+                        if sf[t] != 0:
+                            fills_after += 1
+                        if not np.isnan(phi_hat[t]) and phi_hat[t] <= 0.5:
+                            crossed = fills_after
+                            break
+                    if crossed is not None:
+                        lag_down[N].append(crossed)
+
+        for i in range(3):
+            if not ss[i]:
+                continue
+            samples = np.concatenate(ss[i])
+            phi = seg_phi[i]
+            mean = samples.mean()
+            rmse = np.sqrt(np.mean((samples - phi) ** 2))
+            print(f"  {N:>4} {seg_name[i]:>7} {mean:>9.4f} {mean - phi:>8.4f} "
+                  f"{rmse:>8.4f} {samples.std():>8.4f}")
+
     print()
-    stage0_spread_mismatch_diag(sigma=0.3)
+    print(f"  response lag (fills), predicted ~ N/2; "
+          f"lag computed only on seeds correctly classified at the boundary")
+    print(f"  {'N':>4} {'up_mean':>8} {'up_med':>8} {'down_mean':>10} "
+          f"{'down_med':>9} {'false_up':>9} {'false_dn':>9}")
+    for N in Ns:
+        u, d = np.array(lag_up[N]), np.array(lag_down[N])
+        fu = false_up[N] / n_valid[N] if n_valid[N] else float("nan")
+        fd = false_down[N] / n_valid[N] if n_valid[N] else float("nan")
+        print(f"  {N:>4} {u.mean():>8.1f} {np.median(u):>8.1f} "
+              f"{d.mean():>10.1f} {np.median(d):>9.1f} "
+              f"{fu:>9.3f} {fd:>9.3f}")
+
+
+def stage2_tracking(seed=0, Ns=(20, 50, 100), sigma=0.3, seg_len=1500,
+                    window=600):
+    """Representative-seed numerical tracking around both transitions.
+    Prints phi_true and phi_hat(N) sampled every ~40 ticks near each boundary.
+    Window is wide enough (600 ticks ~= 88 fills) to show the N=100 response,
+    which needs ~50 new fills (~340 ticks) to cross 0.5."""
+    r, schedule = _v3b_primary_run(seed, sigma=sigma, seg_len=seg_len)
+    sf, ds = r["signed_flow"], r["delta_S"]
+    hats = {N: RollingToxicityEstimator(N, sigma).run_offline(sf, ds) for N in Ns}
+
+    for b_name, b in (("0->1", seg_len), ("1->0", 2 * seg_len)):
+        print(f"\n  transition {b_name} at tick {b} (seed={seed})")
+        header = "  ".join(f"N={N}" for N in Ns)
+        print(f"  {'tick':>6} {'phi_true':>9}  {header}")
+        for t in range(b - window, b + window + 1, 40):
+            if t < 0 or t >= len(sf):
+                continue
+            hats_str = "  ".join(
+                f"{hats[N][t]:.2f}" if not np.isnan(hats[N][t]) else " nan"
+                for N in Ns)
+            print(f"  {t:>6} {schedule[t]:>9.1f}  {hats_str}")
+
+
+if __name__ == "__main__":
+    stage2_metrics()
+    stage2_tracking()
