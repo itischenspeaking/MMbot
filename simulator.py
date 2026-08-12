@@ -129,10 +129,12 @@ class InformedFlow:
         log_p = self._log_A - self.kappa * delta
         return 1.0 if log_p >= 0.0 else np.exp(log_p)
 
-    def fills(self, S, bid, ask, rng, delta_S=0.0, informed_rng=None):
+    def fills(self, S, bid, ask, rng, delta_S=0.0, informed_rng=None, t=None):
         # Fixed draw budget regardless of phi or delta_S: u_side is consumed
         # even when the informed branch ignores it, so draw alignment holds
-        # across parameter changes.
+        # across parameter changes. `t` is unused here — kept only so the
+        # call site in run() is identical for InformedFlow and
+        # RegimeInformedFlow (v3b).
         u_side, u_fill = rng.random(2)
         u_type = informed_rng.random()
 
@@ -153,6 +155,81 @@ class InformedFlow:
             return False, u_fill < self._p_fill(ask - S)
         else:
             # Customer sells: hits our bid.
+            return u_fill < self._p_fill(S - bid), False
+
+
+def step_schedule(n_steps, breakpoints, values):
+    """Piecewise-constant phi schedule.
+
+    breakpoints: increasing tick indices where the value changes.
+    values: len(breakpoints) + 1 phi values, one per segment.
+
+    step_schedule(4500, [1500, 3000], [0.0, 1.0, 0.0]) -> low-high-low,
+    1500 ticks per segment.
+    """
+    if len(values) != len(breakpoints) + 1:
+        raise ValueError("values must have one more entry than breakpoints")
+    schedule = np.empty(n_steps)
+    bounds = [0] + list(breakpoints) + [n_steps]
+    for i, v in enumerate(values):
+        schedule[bounds[i]:bounds[i + 1]] = v
+    return schedule
+
+
+class RegimeInformedFlow:
+    """InformedFlow with phi varying over time via a fixed schedule.
+
+    Same mechanics and draw budget as InformedFlow (v3a) — the only change
+    is that phi is looked up per tick from phi_schedule instead of being a
+    constant. A constant schedule is byte-identical to InformedFlow with
+    that phi; see sanity_v3b.py.
+
+    phi_schedule: array of length n_steps. This is the hidden state — run()
+    reads it (for the flow's own use and to log phi_true for later Oracle-
+    benchmark and diagnostic use), but no strategy ever sees it.
+
+    Draw budget per step (unconditional, identical to InformedFlow):
+      flow_rng:     2  (side coin, fill uniform)
+      informed_rng: 1  (informed/uninformed coin)
+    """
+
+    def __init__(self, A, kappa, phi_schedule):
+        if not 0.0 < A <= 1.0:
+            raise ValueError("A must be in (0, 1]")
+        if kappa <= 0.0:
+            raise ValueError("kappa must be positive")
+        phi_schedule = np.asarray(phi_schedule, dtype=float)
+        if np.any((phi_schedule < 0.0) | (phi_schedule > 1.0)):
+            raise ValueError("phi_schedule values must be in [0, 1]")
+        self.A = A
+        self.kappa = kappa
+        self.phi_schedule = phi_schedule
+        self._log_A = np.log(A)
+
+    def _p_fill(self, delta):
+        log_p = self._log_A - self.kappa * delta
+        return 1.0 if log_p >= 0.0 else np.exp(log_p)
+
+    def fills(self, S, bid, ask, rng, delta_S=0.0, informed_rng=None, t=None):
+        # Identical structure to InformedFlow.fills; only phi's source
+        # differs (looked up per tick instead of constant).
+        phi_t = self.phi_schedule[t]
+        u_side, u_fill = rng.random(2)
+        u_type = informed_rng.random()
+
+        if u_type < phi_t:
+            if delta_S > 0:
+                side = "buy"
+            elif delta_S < 0:
+                side = "sell"
+            else:
+                return False, False
+        else:
+            side = "buy" if u_side < 0.5 else "sell"
+
+        if side == "buy":
+            return False, u_fill < self._p_fill(ask - S)
+        else:
             return u_fill < self._p_fill(S - bid), False
 
 
@@ -199,9 +276,14 @@ def run(market, strategy, flow, n_steps=2000, seed=0):
     market_rng = np.random.default_rng(seeds[0])
     flow_rng = np.random.default_rng(seeds[1])
 
-    # Third stream only for informed flow; other flows never see it.
-    is_informed = hasattr(flow, 'phi')
+    # Third stream only for informed flow (v3a) / regime-informed flow (v3b);
+    # other flows never see it.
+    is_informed = hasattr(flow, 'phi') or hasattr(flow, 'phi_schedule')
     informed_rng = np.random.default_rng(seeds[2]) if is_informed else None
+
+    # v3b: hidden toxicity is logged for Oracle-benchmark / diagnostic use
+    # only. No strategy ever reads flow.phi_schedule.
+    has_regime = hasattr(flow, 'phi_schedule')
 
     market.reset()
     acct = Account()
@@ -209,6 +291,8 @@ def run(market, strategy, flow, n_steps=2000, seed=0):
     cols = ("S", "bid", "ask", "inventory", "cash", "pnl",
             "buys", "sells", "delta_S", "signed_flow")
     out = {k: [] for k in cols}
+    if has_regime:
+        out["phi_true"] = []
 
     for t in range(n_steps):
         S = market.S
@@ -221,7 +305,8 @@ def run(market, strategy, flow, n_steps=2000, seed=0):
         if is_informed:
             hit_bid, lift_ask = flow.fills(S, bid, ask, flow_rng,
                                            delta_S=delta_S,
-                                           informed_rng=informed_rng)
+                                           informed_rng=informed_rng,
+                                           t=t)
         else:
             hit_bid, lift_ask = flow.fills(S, bid, ask, flow_rng)
 
@@ -240,6 +325,8 @@ def run(market, strategy, flow, n_steps=2000, seed=0):
         out["sells"].append(lift_ask)
         out["delta_S"].append(delta_S)
         out["signed_flow"].append(int(lift_ask) - int(hit_bid))
+        if has_regime:
+            out["phi_true"].append(flow.phi_schedule[t])
 
         if t < n_steps - 1:
             market.apply_step(delta_S)

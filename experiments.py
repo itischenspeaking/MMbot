@@ -190,8 +190,124 @@ def h_star_fine(phis, hs, k=0.0, n_seeds=1000, **kw):
         row = "  ".join(f"{m:7.1f}" for m in means)
         print(f"  {phi:4.1f}  {row}  {hs[i_max]:6.3f} {fit_h:7.3f} {ses[i_max]:7.2f}")
 
+
+# --------------- v3b Stage 0: effect-size / power analysis ---------------
+#
+# Per-tick expected PnL for the k=0 single-trader model (no-clipping approx):
+#
+#     Pi(h; phi) = A * exp(-kappa*h) * (h - c),   c = phi*sigma*sqrt(2/pi)
+#
+# maximised at h*(phi) = 1/kappa + c. This is the same object v3a's
+# Prediction 2 was derived from; here we integrate it over a schedule to
+# size the Oracle-vs-fixed economic gap BEFORE building any v3b mechanism.
+
+def _pi_per_tick(h, phi, A=0.4, kappa=1.0, sigma=0.1):
+    """Analytical expected PnL per tick at half-spread h under toxicity phi."""
+    c = phi * sigma * np.sqrt(2.0 / np.pi)
+    return A * np.exp(-kappa * h) * (h - c)
+
+
+def _h_star(phi, kappa=1.0, sigma=0.1):
+    return 1.0 / kappa + phi * sigma * np.sqrt(2.0 / np.pi)
+
+
+def _best_fixed_h(segments, A=0.4, kappa=1.0, sigma=0.1):
+    """Best single fixed half-spread for a piecewise-constant schedule.
+
+    segments: list of (length_ticks, phi). Returns (h_best, total_expected_pnl).
+    Total expected PnL is sum over segments of length * Pi(h; phi_seg); we
+    maximise it over h on a fine grid.
+
+    For this exact objective the FOC gives a closed form:
+    Pi_total(h) = A e^{-kappa h} (T*h - sum_i L_i c_i), so the optimum is
+    h* = 1/kappa + (sum_i L_i c_i)/T, i.e. exactly time-weighted-average
+    toxicity. The grid search below agrees with that; we keep it because it
+    reads back the max PnL directly and needs no separate algebra.
+    """
+    hs = np.linspace(0.5, 2.0, 3001)
+    totals = np.array([
+        sum(L * _pi_per_tick(h, phi, A, kappa, sigma) for L, phi in segments)
+        for h in hs
+    ])
+    i = int(np.argmax(totals))
+    return hs[i], totals[i]
+
+
+def stage0_effect_size(A=0.4, kappa=1.0, sigma=0.1,
+                       phi_lo=0.0, phi_hi=1.0, seg_len=1500):
+    """Full low->high->low Oracle vs Best-Fixed analytical effect size."""
+    segments = [(seg_len, phi_lo), (seg_len, phi_hi), (seg_len, phi_lo)]
+    n_steps = 3 * seg_len
+
+    # Oracle: each segment quotes at that segment's own optimum.
+    pnl_oracle = sum(L * _pi_per_tick(_h_star(phi, kappa, sigma), phi,
+                                      A, kappa, sigma)
+                     for L, phi in segments)
+
+    # Best single fixed spread against the whole schedule.
+    h_fixed, pnl_fixed = _best_fixed_h(segments, A, kappa, sigma)
+
+    gap = pnl_oracle - pnl_fixed
+
+    # Expected fills depend on the spread actually quoted, via p_fill =
+    # A*exp(-kappa*h). The Oracle widens h in the high regime, so its
+    # high-regime fill rate is genuinely lower than the low-regime one —
+    # report both against each regime's own Oracle spread rather than a
+    # flat 0.148/tick, so window sizing uses the real per-regime fill count.
+    p_lo = A * np.exp(-kappa * _h_star(phi_lo, kappa, sigma))
+    p_hi = A * np.exp(-kappa * _h_star(phi_hi, kappa, sigma))
+
+    print(f"--- Stage 0 effect size: low->high->low ---")
+    print(f"  A={A}, kappa={kappa}, sigma={sigma}, "
+          f"phi_lo={phi_lo}, phi_hi={phi_hi}, seg_len={seg_len}")
+    print(f"  h*(lo)={_h_star(phi_lo, kappa, sigma):.4f}  "
+          f"h*(hi)={_h_star(phi_hi, kappa, sigma):.4f}  "
+          f"best_fixed_h={h_fixed:.4f}")
+    print(f"  E[PnL] Oracle    = {pnl_oracle:.3f}")
+    print(f"  E[PnL] BestFixed = {pnl_fixed:.3f}")
+    print(f"  Oracle - BestFixed = {gap:.4f}  over {n_steps} ticks")
+    print(f"  Oracle fill rate: lo={p_lo:.4f}/tick  hi={p_hi:.4f}/tick")
+    print(f"  Oracle fills/segment: lo={p_lo * seg_len:.1f}  "
+          f"hi={p_hi * seg_len:.1f}")
+
+
+def stage0_spread_mismatch_diag(n_seeds=1000, n_steps=1000, sigma=0.1,
+                                A=0.4, kappa=1.0):
+    """High-regime spread-mismatch diagnostic (NOT the full Oracle-vs-fixed
+    effect size). Holds phi=1 constant and compares the wrong spread (the
+    optimum for phi=0) against the correct one (the optimum for phi=1),
+    under CRN paired differences.
+
+    Both spreads are derived from sigma via _h_star, so this stays a valid
+    diagnostic when sigma is raised — at sigma=0.1 it is 1.00 vs 1.08, at
+    sigma=0.4 it is 1.00 vs ~1.32. It is the single largest static mismatch
+    the model can produce at phi=1; an upper reference for how visible an
+    h-error of size h*(1)-h*(0) is, not the regime-switching effect (which
+    is much smaller — see stage0_effect_size). Analytical prediction printed
+    alongside so the simulation can be checked against theory.
+    """
+    h_wrong = _h_star(0.0, kappa, sigma)    # optimum if maker assumed phi=0
+    h_correct = _h_star(1.0, kappa, sigma)  # true optimum at phi=1
+
+    dpi = (_pi_per_tick(h_correct, 1.0, A, kappa, sigma)
+           - _pi_per_tick(h_wrong, 1.0, A, kappa, sigma))
+    print(f"h_wrong={h_wrong:.4f}  h_correct={h_correct:.4f}")
+    print(f"analytical E[diff] per tick = {dpi:.6f}  "
+          f"-> over {n_steps} ticks = {dpi * n_steps:.3f}")
+
+    a_low = sweep_v3(half_spread=h_wrong, phi=1.0, k=0.0, sigma=sigma,
+                     A=A, kappa=kappa, n_steps=n_steps, n_seeds=n_seeds)
+    a_high = sweep_v3(half_spread=h_correct, phi=1.0, k=0.0, sigma=sigma,
+                      A=A, kappa=kappa, n_steps=n_steps, n_seeds=n_seeds)
+    diff = a_high[:, 1] - a_low[:, 1]  # column 1 = total pnl, same seed order
+    se = diff.std(ddof=1) / np.sqrt(len(diff))
+    print(f"mean(h_wrong)   = {a_low[:, 1].mean():.2f}")
+    print(f"mean(h_correct) = {a_high[:, 1].mean():.2f}")
+    print(f"paired diff: mean={diff.mean():.3f}  std={diff.std(ddof=1):.3f}  "
+          f"se={se:.3f}  t={diff.mean() / se:.2f}")
+
+
 if __name__ == "__main__":
-    h_star_fine(
-        phis=[0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
-        hs=[0.90, 0.95, 1.00, 1.025, 1.05, 1.075, 1.10, 1.15, 1.20],
-    )
+    stage0_effect_size(sigma=0.3)
+    print()
+    stage0_spread_mismatch_diag(sigma=0.3)
