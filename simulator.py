@@ -90,6 +90,72 @@ class QuoteSensitiveFlow:
         return hit, lift
 
 
+class InformedFlow:
+    """One trader per step. Type first, then side, then fill.
+
+    With probability phi the trader is direction-informed: it sees
+    sign(delta_S) and picks the side that profits from the coming move
+    (buys before a rise, sells before a fall). Otherwise it is uninformed
+    and picks a side by coin flip. Either way, whether the chosen side
+    actually fills uses the same A*exp(-kappa*delta) probability.
+
+    phi therefore changes only the direction distribution of attempts,
+    not the arrival process — fills per step stay comparable across phi,
+    which is what makes the toxicity attribution clean.
+
+    Note this is one attempt per step (max 1 fill), unlike
+    QuoteSensitiveFlow's two independent sides (max 2). phi=0 is
+    statistically equivalent to a halved-intensity symmetric flow, not
+    byte-identical to v2.
+
+    Draw budget per step (unconditional):
+      flow_rng:     2  (side coin, fill uniform)
+      informed_rng: 1  (informed/uninformed coin)
+    """
+
+    def __init__(self, A, kappa, phi):
+        if not 0.0 < A <= 1.0:
+            raise ValueError("A must be in (0, 1]")
+        if kappa <= 0.0:
+            raise ValueError("kappa must be positive")
+        if not 0.0 <= phi <= 1.0:
+            raise ValueError("phi must be in [0, 1]")
+        self.A = A
+        self.kappa = kappa
+        self.phi = phi
+        self._log_A = np.log(A)
+
+    def _p_fill(self, delta):
+        log_p = self._log_A - self.kappa * delta
+        return 1.0 if log_p >= 0.0 else np.exp(log_p)
+
+    def fills(self, S, bid, ask, rng, delta_S=0.0, informed_rng=None):
+        # Fixed draw budget regardless of phi or delta_S: u_side is consumed
+        # even when the informed branch ignores it, so draw alignment holds
+        # across parameter changes.
+        u_side, u_fill = rng.random(2)
+        u_type = informed_rng.random()
+
+        if u_type < self.phi:
+            # Informed: side dictated by the coming move. delta_S == 0
+            # (last tick) gives the informed trader nothing to act on.
+            if delta_S > 0:
+                side = "buy"
+            elif delta_S < 0:
+                side = "sell"
+            else:
+                return False, False
+        else:
+            side = "buy" if u_side < 0.5 else "sell"
+
+        if side == "buy":
+            # Customer buys: lifts our ask.
+            return False, u_fill < self._p_fill(ask - S)
+        else:
+            # Customer sells: hits our bid.
+            return u_fill < self._p_fill(S - bid), False
+
+
 class Account:
     def __init__(self):
         self.cash = 0.0
@@ -111,23 +177,53 @@ class Account:
 
 
 def run(market, strategy, flow, n_steps=2000, seed=0):
+    """Run the simulation loop.
+
+    v3 ordering within a step:
+
+        1. read S_t
+        2. maker quotes on S_t
+        3. pre-generate delta_S (but don't move the price yet)
+        4. flow decides fills — InformedFlow can see sign(delta_S)
+        5. record everything at time t
+        6. apply delta_S to get S_{t+1}, except after the last tick
+
+    SeedSequence.spawn(3) produces the same first two streams as spawn(2),
+    so v0/v1/v2 flows get byte-identical price paths and fill sequences.
+    The third stream is consumed only by InformedFlow.
+    """
     if n_steps < 1:
         raise ValueError("n_steps must be at least 1")
 
-    market_seed, flow_seed = np.random.SeedSequence(seed).spawn(2)
-    market_rng = np.random.default_rng(market_seed)
-    flow_rng = np.random.default_rng(flow_seed)
+    seeds = np.random.SeedSequence(seed).spawn(3)
+    market_rng = np.random.default_rng(seeds[0])
+    flow_rng = np.random.default_rng(seeds[1])
+
+    # Third stream only for informed flow; other flows never see it.
+    is_informed = hasattr(flow, 'phi')
+    informed_rng = np.random.default_rng(seeds[2]) if is_informed else None
 
     market.reset()
     acct = Account()
 
-    cols = ("S", "bid", "ask", "inventory", "cash", "pnl", "buys", "sells")
+    cols = ("S", "bid", "ask", "inventory", "cash", "pnl",
+            "buys", "sells", "delta_S", "signed_flow")
     out = {k: [] for k in cols}
 
     for t in range(n_steps):
         S = market.S
         bid, ask = strategy.quote(S, acct.inventory)
-        hit_bid, lift_ask = flow.fills(S, bid, ask, flow_rng)
+
+        # Pre-generate the price move. Informed flow can see its sign,
+        # but the price doesn't move until after fills and recording.
+        delta_S = market.generate_step(market_rng) if t < n_steps - 1 else 0.0
+
+        if is_informed:
+            hit_bid, lift_ask = flow.fills(S, bid, ask, flow_rng,
+                                           delta_S=delta_S,
+                                           informed_rng=informed_rng)
+        else:
+            hit_bid, lift_ask = flow.fills(S, bid, ask, flow_rng)
 
         if hit_bid:
             acct.buy(bid)
@@ -142,9 +238,11 @@ def run(market, strategy, flow, n_steps=2000, seed=0):
         out["pnl"].append(acct.pnl(S))
         out["buys"].append(hit_bid)
         out["sells"].append(lift_ask)
+        out["delta_S"].append(delta_S)
+        out["signed_flow"].append(int(lift_ask) - int(hit_bid))
 
         if t < n_steps - 1:
-            market.step(market_rng)
+            market.apply_step(delta_S)
 
     res = {k: np.array(v) for k, v in out.items()}
     res["n_trades"] = acct.n_trades

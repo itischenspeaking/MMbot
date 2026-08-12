@@ -20,3 +20,11 @@ class RandomWalk:
     def step(self, rng):
         self.S += self.sigma * rng.standard_normal()
         return self.S
+
+    def generate_step(self, rng):
+        """Return the next price increment without applying it."""
+        return self.sigma * rng.standard_normal()
+
+    def apply_step(self, delta_S):
+        """Apply a pre-generated increment."""
+        self.S += delta_S
