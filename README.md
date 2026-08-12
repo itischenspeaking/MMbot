@@ -47,6 +47,18 @@ all, mean/std still peaks at positive k — traced by exact P&L attribution to a
 negative correlation skew induces between baseline fill income and its own
 correction, not to any inventory-price effect. [Log](v2_log.md)
 
-**v3** — in progress. Order flow so far is uninformed; v3 introduces flow that
-carries information about future fair value and asks whether the maker should
-update its quoting on that, not just on inventory.
+**v3a** — flow becomes single-trader-per-tick; with probability phi the trader
+sees sign(delta_S) and trades in that direction, otherwise picks a side by
+coin flip (fill probability unchanged either way). This decouples toxicity
+from volume — fill count stays flat across phi — so P&L changes trace cleanly
+to adverse selection. Signed one-step markout scales linearly in phi and
+matches sigma·√(2/π) to four significant figures at phi = 1. Inventory skew
+(v2) cuts RMS inventory by 88% without moving markout at all — inventory
+control and adverse-selection control are different problems. A coarse h
+sweep found no shift in the optimal spread; the predicted shift turned out to
+be ~0.08, under the grid spacing, so a fine grid with a quadratic peak fit was
+needed to see it — it tracks h*(phi) ≈ 1/κ + phi·σ·√(2/π) within 0.013 across
+six phi values. [Log](v3a_log.md)
+
+**v3b** — in progress. v3a takes toxicity as known and fixed. v3b estimates it
+from observed fills and markouts and adapts quoting online.
