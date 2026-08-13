@@ -60,5 +60,17 @@ be ~0.08, under the grid spacing, so a fine grid with a quadratic peak fit was
 needed to see it — it tracks h*(phi) ≈ 1/κ + phi·σ·√(2/π) within 0.013 across
 six phi values. [Log](v3a_log.md)
 
-**v3b** — in progress. v3a takes toxicity as known and fixed. v3b estimates it
-from observed fills and markouts and adapts quoting online.
+**v3b** — phi becomes hidden and time-varying (schedule 0→1→0) instead of
+known and fixed. A rolling estimator inverts v3a's own calibration,
+phi_hat = clip(mean(last N fill markouts)/(sigma·√(2/π)), 0, 1), using only
+fills — no-fill ticks don't update it, and phi_hat is NaN until N fills
+accumulate. Response lag and steady-state noise both land almost exactly on
+their pre-registered predictions: lag ≈ N/2 fills (9.5/23.9/48.8 observed
+for N=20/50/100 against a ~10/25/50 prediction) and noise ∝ 1/√N. N=50 is
+the practical compromise. Feeding phi_hat into v3a's h_t = 1/κ +
+phi_hat·σ·√(2/π) makes an AdaptiveMaker that widens and narrows in the
+correct regimes, closing roughly 60–70% of the gap between a fixed spread
+and an oracle that knows phi_t exactly — but the available opportunity
+itself is small (~4 P&L over 4500 ticks), and k=0 inventory noise keeps the
+Adaptive-vs-Fixed P&L gain from clearing significance at 3000 seeds even
+though the oracle-vs-fixed gap does. [Log](v3b_log.md)
