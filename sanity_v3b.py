@@ -16,7 +16,8 @@ import numpy as np
 
 from market import RandomWalk
 from simulator import InformedFlow, RegimeInformedFlow, step_schedule, run
-from strategy import InventorySkewMaker, RollingToxicityEstimator
+from strategy import (InventorySkewMaker, RollingToxicityEstimator,
+                      AdaptiveMaker, OracleMaker, _h_star)
 
 SIGMA = 0.3  # v3b primary (Stage 0)
 SIGMA_SQRT_2_OVER_PI = SIGMA * np.sqrt(2.0 / np.pi)
@@ -206,6 +207,86 @@ def test_estimator_offline_independent_of_N():
              n_steps=N_STEPS, seed=3)
     assert np.array_equal(sf, r2["signed_flow"])
     assert np.array_equal(ds, r2["delta_S"])
+
+
+# --- Stage 3 closed-loop timing sanity ---
+
+def test_adaptive_warmup_identical_to_fixed():
+    """Before N fills accumulate, AdaptiveMaker must quote exactly the warm-up
+    (BestFixed) spread, i.e. be byte-identical to a Fixed maker at h_warmup up
+    to the tick where the Nth fill lands."""
+    N, h_warmup = 50, 1.08
+    sched = _primary_schedule()
+    ra = run(RandomWalk(sigma=SIGMA),
+             AdaptiveMaker(N=N, sigma=SIGMA, h_warmup=h_warmup, kappa=1.0),
+             RegimeInformedFlow(A=0.4, kappa=1.0, phi_schedule=sched),
+             n_steps=N_STEPS, seed=0)
+    rf = run(RandomWalk(sigma=SIGMA),
+             InventorySkewMaker(half_spread=h_warmup, k=0.0),
+             RegimeInformedFlow(A=0.4, kappa=1.0, phi_schedule=sched),
+             n_steps=N_STEPS, seed=0)
+    # find tick of the Nth fill in the adaptive run
+    fills = np.cumsum(ra["signed_flow"] != 0)
+    nth = int(np.argmax(fills >= N))  # first tick where cumulative fills == N
+    # up to and including that tick, quotes must match Fixed exactly
+    assert np.allclose(ra["bid"][:nth + 1], rf["bid"][:nth + 1])
+    assert np.allclose(ra["ask"][:nth + 1], rf["ask"][:nth + 1])
+    # and they must diverge somewhere after (adaptive starts moving h)
+    assert not np.allclose(ra["ask"][nth + 1:], rf["ask"][nth + 1:])
+
+
+def test_adaptive_no_lookahead():
+    """The quote at tick t must use phi_hat from fills strictly before t.
+    Post-warmup, realized adaptive h must equal h_star(phi_hat observed up to
+    t-1). phi_after_t = run_offline(...)[t] is phi_hat AFTER observing tick t,
+    so the maker's tick-t quote uses phi_after_t[t-1]."""
+    N = 50
+    sched = _primary_schedule()
+    ra = run(RandomWalk(sigma=SIGMA),
+             AdaptiveMaker(N=N, sigma=SIGMA, h_warmup=1.08, kappa=1.0),
+             RegimeInformedFlow(A=0.4, kappa=1.0, phi_schedule=sched),
+             n_steps=N_STEPS, seed=2)
+    h_realized = (ra["ask"] - ra["bid"]) / 2.0
+    phi_after_t = RollingToxicityEstimator(N, SIGMA).run_offline(
+        ra["signed_flow"], ra["delta_S"])
+    for t in range(1, N_STEPS):
+        pt = phi_after_t[t - 1]
+        if np.isnan(pt):
+            continue
+        assert abs(h_realized[t] - _h_star(pt, 1.0, SIGMA)) < 1e-9, t
+
+
+def test_oracle_tracks_true_phi():
+    """OracleMaker's realized h must equal h_star(phi_true_t) every tick."""
+    sched = _primary_schedule()
+    ro = run(RandomWalk(sigma=SIGMA),
+             OracleMaker(phi_schedule=sched, sigma=SIGMA, kappa=1.0),
+             RegimeInformedFlow(A=0.4, kappa=1.0, phi_schedule=sched),
+             n_steps=N_STEPS, seed=1)
+    h_realized = (ro["ask"] - ro["bid"]) / 2.0
+    h_target = np.array([_h_star(p, 1.0, SIGMA) for p in sched])
+    assert np.allclose(h_realized, h_target)
+
+
+def test_crn_price_path_shared_across_strategies():
+    """CRN: same seed => identical price path for Fixed/Adaptive/Oracle, even
+    though fills diverge because quotes differ."""
+    sched = _primary_schedule()
+    common = dict(n_steps=N_STEPS, seed=9)
+    rf = run(RandomWalk(sigma=SIGMA),
+             InventorySkewMaker(half_spread=1.08, k=0.0),
+             RegimeInformedFlow(A=0.4, kappa=1.0, phi_schedule=sched), **common)
+    ra = run(RandomWalk(sigma=SIGMA),
+             AdaptiveMaker(N=50, sigma=SIGMA, h_warmup=1.08, kappa=1.0),
+             RegimeInformedFlow(A=0.4, kappa=1.0, phi_schedule=sched), **common)
+    ro = run(RandomWalk(sigma=SIGMA),
+             OracleMaker(phi_schedule=sched, sigma=SIGMA),
+             RegimeInformedFlow(A=0.4, kappa=1.0, phi_schedule=sched), **common)
+    assert np.array_equal(rf["S"], ra["S"])
+    assert np.array_equal(rf["S"], ro["S"])
+    assert np.array_equal(rf["delta_S"], ra["delta_S"])
+    # fills must actually diverge somewhere (else CRN comparison is trivial)
+    assert not np.array_equal(rf["signed_flow"], ra["signed_flow"])
 
 
 if __name__ == "__main__":

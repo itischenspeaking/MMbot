@@ -115,3 +115,85 @@ class RollingToxicityEstimator:
         for t in range(len(signed_flow)):
             out[t] = self.update(signed_flow[t], delta_S[t])
         return out
+
+
+# --------------------------------------------------------------------------
+# v3b Stage 3: closed-loop adaptive quoting.
+# --------------------------------------------------------------------------
+
+def _h_star(phi, kappa, sigma):
+    """v3a-verified optimal half-spread: 1/kappa + phi*sigma*sqrt(2/pi)."""
+    return 1.0 / kappa + phi * sigma * np.sqrt(2.0 / np.pi)
+
+
+class AdaptiveMaker:
+    """Quote a spread that adapts to estimated toxicity (v3b Stage 3).
+
+    Closed loop: each tick quotes on the phi_hat available from fills observed
+    up to the PREVIOUS tick, then observe(markout) folds in the current tick's
+    realized markout for use next tick. It never sees phi_true.
+
+        h_t = 1/kappa + phi_hat_t * sigma * sqrt(2/pi)
+
+    Warm-up: until the estimator has N fills, phi_hat is NaN and the maker
+    quotes at h_warmup (the BestFixed spread). So before it has enough data
+    the Adaptive maker is identical to the Fixed baseline — the capture
+    fraction then measures learning value alone, not the coincidence that the
+    schedule happens to start in the low regime.
+
+    k is kept in the signature for parity but the v3b main experiment fixes
+    k=0 (no inventory skew); center = S.
+
+      N          estimator window, in fills
+      sigma      known volatility (for both estimator and h formula)
+      h_warmup   spread used before N fills accumulate (BestFixed h)
+      kappa      known flow decay
+    """
+
+    def __init__(self, N, sigma, h_warmup, kappa=1.0, k=0.0):
+        self.est = RollingToxicityEstimator(N, sigma)
+        self.sigma = sigma
+        self.h_warmup = h_warmup
+        self.kappa = kappa
+        self.k = k
+
+    def quote(self, S, inventory):
+        phi_hat = self.est._phi_hat  # estimate from fills up to previous tick
+        if np.isnan(phi_hat):
+            h = self.h_warmup
+        else:
+            h = _h_star(phi_hat, self.kappa, self.sigma)
+        center = S - self.k * inventory
+        return center - h, center + h
+
+    def observe(self, signed_flow, delta_S):
+        """Fold this tick's realized markout into the estimator, for use from
+        the next tick onward. Called by run() after delta_S has been applied."""
+        self.est.update(signed_flow, delta_S)
+
+
+class OracleMaker:
+    """Upper benchmark: quotes at the true-phi optimum every tick (v3b Stage 3).
+
+    Holds the hidden schedule and reads phi_t via a tick index set by run()'s
+    set_t hook. This is NOT a realistic strategy — no maker sees phi_true — it
+    exists only to bound how much a perfect toxicity signal is worth.
+
+        h_t = 1/kappa + phi_true_t * sigma * sqrt(2/pi)
+    """
+
+    def __init__(self, phi_schedule, sigma, kappa=1.0, k=0.0):
+        self.phi_schedule = np.asarray(phi_schedule, dtype=float)
+        self.sigma = sigma
+        self.kappa = kappa
+        self.k = k
+        self._t = 0
+
+    def set_t(self, t):
+        self._t = t
+
+    def quote(self, S, inventory):
+        phi = self.phi_schedule[self._t]
+        h = _h_star(phi, self.kappa, self.sigma)
+        center = S - self.k * inventory
+        return center - h, center + h

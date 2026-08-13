@@ -296,6 +296,10 @@ def run(market, strategy, flow, n_steps=2000, seed=0):
 
     for t in range(n_steps):
         S = market.S
+        # v3b Stage 3: Oracle reads phi_true via its own tick index. Only the
+        # Oracle exposes set_t; Adaptive/Fixed never see phi_true.
+        if hasattr(strategy, 'set_t'):
+            strategy.set_t(t)
         bid, ask = strategy.quote(S, acct.inventory)
 
         # Pre-generate the price move. Informed flow can see its sign,
@@ -330,6 +334,13 @@ def run(market, strategy, flow, n_steps=2000, seed=0):
 
         if t < n_steps - 1:
             market.apply_step(delta_S)
+
+        # v3b Stage 3: closed-loop feedback. observe() folds this tick's
+        # realized markout (signed_flow_t * delta_S_t) into the estimator for
+        # use from the NEXT tick's quote. Placed after apply_step so the move
+        # is already realized — no look-ahead. Only AdaptiveMaker exposes it.
+        if hasattr(strategy, 'observe'):
+            strategy.observe(out["signed_flow"][-1], delta_S)
 
     res = {k: np.array(v) for k, v in out.items()}
     res["n_trades"] = acct.n_trades

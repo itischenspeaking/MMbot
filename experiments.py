@@ -5,7 +5,8 @@ import numpy as np
 from market import RandomWalk
 from simulator import (BernoulliFlow, QuoteSensitiveFlow, InformedFlow,
                        RegimeInformedFlow, step_schedule, run)
-from strategy import NaiveMaker, InventorySkewMaker, RollingToxicityEstimator
+from strategy import (NaiveMaker, InventorySkewMaker, RollingToxicityEstimator,
+                      AdaptiveMaker, OracleMaker, _h_star)
 
 
 def sweep(n_seeds=500, n_steps=2000, sigma=0.1, half_spread=0.5, trade_prob=0.3):
@@ -456,6 +457,150 @@ def stage2_tracking(seed=0, Ns=(20, 50, 100), sigma=0.3, seg_len=1500,
             print(f"  {t:>6} {schedule[t]:>9.1f}  {hats_str}")
 
 
+# --------------- v3b Stage 3: closed-loop adaptive quoting ---------------
+
+def stage3_compare(n_seeds=1000, sigma=0.3, seg_len=1500, N=50,
+                   A=0.4, kappa=1.0):
+    """CRN paired comparison: BestFixed vs Adaptive vs Oracle on the primary
+    0->1->0 schedule. Same seed => same price path and same (u_side,u_fill,
+    u_type) draws for all three; fills diverge only because quotes differ.
+    """
+    n_steps = 3 * seg_len
+    schedule = step_schedule(n_steps, [seg_len, 2 * seg_len], [0.0, 1.0, 0.0])
+    h_best = _best_fixed_h([(seg_len, 0.0), (seg_len, 1.0), (seg_len, 0.0)],
+                           A=A, kappa=kappa, sigma=sigma)[0]
+
+    bounds = [0, seg_len, 2 * seg_len, n_steps]
+    pnl_f, pnl_a, pnl_o = [], [], []
+    fills_f, fills_a, fills_o = [], [], []
+    h_by_regime = {0: [], 1: [], 2: []}  # adaptive avg h per regime (diagnostic)
+    phi_err = []  # adaptive phi_hat RMSE vs phi_true (post-warmup, all ticks)
+    # closed-loop response lag, from the ADAPTIVE run's own fill sequence
+    # (reflects the second-order feedback: wider h in high regime -> fewer
+    # fills -> slower estimator updates). Lag counted only on seeds correctly
+    # classified at the boundary; wrong-side seeds counted separately.
+    lag_up_f, lag_down_f = [], []      # response lag in fills
+    lag_up_t, lag_down_t = [], []      # response lag in ticks
+    false_up = false_down = n_valid = 0
+
+    scale = sigma * np.sqrt(2.0 / np.pi)
+
+    for seed in range(n_seeds):
+        rf = run(RandomWalk(sigma=sigma),
+                 InventorySkewMaker(half_spread=h_best, k=0.0),
+                 RegimeInformedFlow(A=A, kappa=kappa, phi_schedule=schedule),
+                 n_steps=n_steps, seed=seed)
+        ra = run(RandomWalk(sigma=sigma),
+                 AdaptiveMaker(N=N, sigma=sigma, h_warmup=h_best, kappa=kappa),
+                 RegimeInformedFlow(A=A, kappa=kappa, phi_schedule=schedule),
+                 n_steps=n_steps, seed=seed)
+        ro = run(RandomWalk(sigma=sigma),
+                 OracleMaker(phi_schedule=schedule, sigma=sigma, kappa=kappa),
+                 RegimeInformedFlow(A=A, kappa=kappa, phi_schedule=schedule),
+                 n_steps=n_steps, seed=seed)
+
+        pnl_f.append(rf["pnl"][-1])
+        pnl_a.append(ra["pnl"][-1])
+        pnl_o.append(ro["pnl"][-1])
+        fills_f.append(rf["n_trades"])
+        fills_a.append(ra["n_trades"])
+        fills_o.append(ro["n_trades"])
+
+        # adaptive avg h per regime, from logged quotes: h = (ask - bid)/2
+        h_a = (ra["ask"] - ra["bid"]) / 2.0
+        for i in range(3):
+            h_by_regime[i].append(h_a[bounds[i]:bounds[i + 1]].mean())
+
+        # adaptive phi_hat error: reconstruct phi_hat path offline from the
+        # SAME (adaptive) log — estimator is deterministic given the fill log
+        sf_a, ds_a = ra["signed_flow"], ra["delta_S"]
+        phi_hat = RollingToxicityEstimator(N, sigma).run_offline(sf_a, ds_a)
+        m = ~np.isnan(phi_hat)
+        phi_err.append(np.sqrt(np.mean((phi_hat[m] - schedule[m]) ** 2)))
+
+        # closed-loop response lag off the adaptive fill sequence
+        b = seg_len  # 0 -> 1
+        pre = phi_hat[b - 1]
+        if not np.isnan(pre):
+            n_valid += 1
+            if pre >= 0.5:
+                false_up += 1
+            else:
+                fa, crossed = 0, None
+                for t in range(b, bounds[2]):
+                    if sf_a[t] != 0:
+                        fa += 1
+                    if not np.isnan(phi_hat[t]) and phi_hat[t] >= 0.5:
+                        crossed = (fa, t - b)
+                        break
+                if crossed is not None:
+                    lag_up_f.append(crossed[0])
+                    lag_up_t.append(crossed[1])
+        b = 2 * seg_len  # 1 -> 0
+        pre = phi_hat[b - 1]
+        if not np.isnan(pre):
+            if pre <= 0.5:
+                false_down += 1
+            else:
+                fa, crossed = 0, None
+                for t in range(b, bounds[3]):
+                    if sf_a[t] != 0:
+                        fa += 1
+                    if not np.isnan(phi_hat[t]) and phi_hat[t] <= 0.5:
+                        crossed = (fa, t - b)
+                        break
+                if crossed is not None:
+                    lag_down_f.append(crossed[0])
+                    lag_down_t.append(crossed[1])
+
+    pnl_f = np.array(pnl_f)
+    pnl_a = np.array(pnl_a)
+    pnl_o = np.array(pnl_o)
+
+    def _paired(d, label):
+        mean = d.mean()
+        se = d.std(ddof=1) / np.sqrt(len(d))
+        print(f"  {label:18s} mean={mean:8.3f}  se={se:6.3f}  "
+              f"95%CI=[{mean - 1.96 * se:7.3f}, {mean + 1.96 * se:7.3f}]")
+
+    print(f"=== Stage 3: BestFixed vs Adaptive vs Oracle ===")
+    print(f"  sigma={sigma}, N={N}, seg_len={seg_len}, k=0, "
+          f"best_fixed_h={h_best:.4f}, n_seeds={n_seeds}")
+    print(f"  mean terminal PnL: Fixed={pnl_f.mean():.2f}  "
+          f"Adaptive={pnl_a.mean():.2f}  Oracle={pnl_o.mean():.2f}")
+    print(f"  paired differences (same-seed):")
+    _paired(pnl_a - pnl_f, "Adaptive - Fixed")
+    _paired(pnl_o - pnl_a, "Oracle - Adaptive")
+    _paired(pnl_o - pnl_f, "Oracle - Fixed")
+
+    af = (pnl_a - pnl_f).mean()
+    of = (pnl_o - pnl_f).mean()
+    capture_noisy = af / of if of != 0 else float("nan")
+    capture_theory = af / 3.7948  # Stage 0 analytical Oracle-BestFixed gap
+    print(f"  capture fraction (noisy ratio) = mean(A-F)/mean(O-F) = "
+          f"{capture_noisy:.3f}")
+    print(f"  capture fraction / theory      = mean(A-F)/3.7948     = "
+          f"{capture_theory:.3f}")
+
+    print(f"  diagnostics:")
+    print(f"    fills: Fixed={np.mean(fills_f):.1f}  "
+          f"Adaptive={np.mean(fills_a):.1f}  Oracle={np.mean(fills_o):.1f}")
+    print(f"    adaptive avg h by regime: "
+          f"low={np.mean(h_by_regime[0]):.4f}  "
+          f"high={np.mean(h_by_regime[1]):.4f}  "
+          f"low={np.mean(h_by_regime[2]):.4f}  "
+          f"(oracle target: low={_h_star(0.0, kappa, sigma):.4f} "
+          f"high={_h_star(1.0, kappa, sigma):.4f})")
+    print(f"    adaptive phi_hat RMSE (post-warmup) = {np.mean(phi_err):.4f}")
+    print(f"    closed-loop response lag (adaptive fill sequence, "
+          f"correctly-classified seeds only):")
+    uf, df = np.array(lag_up_f), np.array(lag_down_f)
+    ut, dt = np.array(lag_up_t), np.array(lag_down_t)
+    print(f"      0->1: {uf.mean():.1f} fills / {ut.mean():.0f} ticks   "
+          f"1->0: {df.mean():.1f} fills / {dt.mean():.0f} ticks")
+    print(f"      pre-boundary false-side rate: "
+          f"up={false_up / n_valid:.3f}  down={false_down / n_valid:.3f}")
+
+
 if __name__ == "__main__":
-    stage2_metrics()
-    stage2_tracking()
+    stage3_compare(n_seeds=3000)
