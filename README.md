@@ -74,3 +74,15 @@ and an oracle that knows phi_t exactly — but the available opportunity
 itself is small (~4 P&L over 4500 ticks), and k=0 inventory noise keeps the
 Adaptive-vs-Fixed P&L gain from clearing significance at 3000 seeds even
 though the oracle-vs-fixed gap does. [Log](v3b_log.md)
+
+**v4** — in progress. v2 controls inventory, v3 controls toxicity, each in
+isolation; v4 joins them and asks whether the combined policy generalizes
+past the one environment it was tuned on. Five sub-projects: v4pre wires
+inventory skew and toxicity-adaptive spread into one bot (`IntegratedMaker`)
+and freezes a competition baseline; v4a asks whether inventory control and
+toxicity control complement or fight each other; v4b studies online
+learning under randomly-switching (not scripted) toxicity, first at k=0
+then with inventory skew back on; v4c asks whether the quote actually needs
+separate phi/sigma estimates or whether the observable markout alone is
+already sufficient; v4d tunes on a development set and evaluates once,
+unseen, on held-out seeds. [Log](v4_log.md)
