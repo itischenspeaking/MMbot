@@ -7,8 +7,7 @@ v2 controls inventory. v3 controls toxicity. Both in isolation. v4 asks:
 > one environment it was tuned on?
 
 Five sub-projects, each answering one question, each with a fixed spread
-definition and no scope creep once started. Frozen after a joint review
-(Claude + GPT), not renegotiated mid-implementation.
+definition and no scope creep once started. 
 
 ## v4pre — integrated baseline (formerly "v3.5")
 
