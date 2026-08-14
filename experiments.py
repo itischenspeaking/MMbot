@@ -4,7 +4,7 @@ import numpy as np
 
 from market import RandomWalk
 from simulator import (BernoulliFlow, QuoteSensitiveFlow, InformedFlow,
-                       RegimeInformedFlow, step_schedule, run)
+                       RegimeInformedFlow, step_schedule, markov_schedule, run)
 from strategy import (NaiveMaker, InventorySkewMaker, RollingToxicityEstimator,
                       AdaptiveMaker, OracleMaker, IntegratedMaker, _h_star)
 
@@ -1117,5 +1117,176 @@ def exp3_interaction_economics(n_seeds=3000, sigma=0.3, seg_len=1500, N=50,
           f"(pre-specified prediction: < 1)")
 
 
+# --------------- v4b: hidden stochastic (Markov) toxicity -------------------
+#
+# Environment: two-state Markov phi_t in {0,1}, switch prob p per tick (mean
+# regime length ~1/p). Same fill mechanics, same N=50 rolling estimator as
+# v3b/v4a. No estimator upgrade — the question is whether the existing tool
+# still tracks when toxicity is genuinely hidden and stochastic.
+
+P_PRIMARY = 0.002   # mean regime length ~500 ticks (comfortably > the ~170-tick
+                    # N=50 response window, but switches ~9x over 4500 ticks)
+
+
+def _switch_response_lags(phi_hat, schedule, sf, N):
+    """Response behavior at true regime switches. For each eligible switch,
+    count fills until phi_hat crosses 0.5 toward the new state, searching only
+    up to the NEXT true switch.
+
+    Eligibility (v3b convention): the estimator must be on the OLD-state side
+    just before the switch — 0->1 requires pre < 0.5, 1->0 requires pre > 0.5.
+    Switches already on the new side, or with NaN pre, are not eligible.
+
+    Crucially, eligible transitions that do NOT cross before the next switch
+    are counted as UNRESOLVED (they enter the denominator) rather than dropped
+    — dropping them would hide exactly the short-regime failures that matter
+    most under stochastic switching (survivorship bias).
+
+    Returns (lags_list over resolved transitions, n_resolved, n_eligible).
+    The caller pools lags across seeds so every resolved transition carries
+    equal weight (a seed with 8 resolved switches shouldn't count the same as
+    a seed with 1)."""
+    switches = np.flatnonzero(np.diff(schedule) != 0) + 1
+    lags = []
+    n_eligible = 0
+    for i, b in enumerate(switches):
+        new_state = schedule[b]
+        pre = phi_hat[b - 1]
+        if np.isnan(pre):
+            continue
+        if new_state == 1.0:
+            if pre >= 0.5:
+                continue
+            hit = lambda x: x >= 0.5
+        else:
+            if pre <= 0.5:
+                continue
+            hit = lambda x: x <= 0.5
+        n_eligible += 1
+        nxt = switches[switches > b]
+        stop = nxt[0] if len(nxt) else len(schedule)
+        fa, res = 0, None
+        for t in range(b, stop):
+            if sf[t] != 0:
+                fa += 1
+            if not np.isnan(phi_hat[t]) and hit(phi_hat[t]):
+                res = fa
+                break
+        if res is not None:
+            lags.append(res)          # resolved: record lag
+        # else: unresolved — counted in n_eligible, no fabricated lag
+    return lags, len(lags), n_eligible
+
+
+def exp2b_markov_tracking(p=P_PRIMARY, sigma=0.3, N=50, A=0.4, kappa=1.0,
+                          n_steps=4500, n_seeds=300):
+    """Exp2 — can the existing N=50 rolling estimator track a hidden Markov
+    toxicity path at k=0? Reports tracking RMSE and mean switch response lag.
+    Offline estimator on a fixed-quote maker (h=1), so estimation is decoupled
+    from quoting feedback."""
+    rmses, fills_ct = [], []
+    rmse_lo, rmse_hi = [], []
+    lags, n_res_tot, n_elig_tot = [], 0, 0
+    for seed in range(n_seeds):
+        schedule = markov_schedule(n_steps, p, seed=seed)
+        r = run(RandomWalk(sigma=sigma),
+                InventorySkewMaker(half_spread=1.0, k=0.0),
+                RegimeInformedFlow(A=A, kappa=kappa, phi_schedule=schedule),
+                n_steps=n_steps, seed=seed)
+        sf, ds = r["signed_flow"], r["delta_S"]
+        phi_hat = RollingToxicityEstimator(N, sigma).run_offline(sf, ds)
+        m = ~np.isnan(phi_hat)
+        rmses.append(np.sqrt(np.mean((phi_hat[m] - schedule[m]) ** 2)))
+        lo = m & (schedule == 0.0)
+        hi = m & (schedule == 1.0)
+        if lo.any():
+            rmse_lo.append(np.sqrt(np.mean((phi_hat[lo] - 0.0) ** 2)))
+        if hi.any():
+            rmse_hi.append(np.sqrt(np.mean((phi_hat[hi] - 1.0) ** 2)))
+        mean_lag, n_res, n_elig = _switch_response_lags(phi_hat, schedule, sf, N)
+        lags.extend(mean_lag)          # pool all resolved transitions
+        n_res_tot += n_res
+        n_elig_tot += n_elig
+        fills_ct.append(int((sf != 0).sum()))
+
+    res_rate = n_res_tot / n_elig_tot if n_elig_tot else float("nan")
+    print(f"=== Exp2b: N=50 rolling estimator on hidden Markov toxicity (k=0) ===")
+    print(f"  sigma={sigma}, p={p} (mean regime ~{1/p:.0f} ticks), "
+          f"N={N}, n_steps={n_steps}, n_seeds={n_seeds}")
+    print(f"  tracking RMSE (all)   = {np.mean(rmses):.4f}")
+    print(f"  tracking RMSE (low)   = {np.nanmean(rmse_lo):.4f}")
+    print(f"  tracking RMSE (high)  = {np.nanmean(rmse_hi):.4f}")
+    print(f"  switch resp lag       = {np.mean(lags):.1f} fills, resolved "
+          f"(pooled over transitions; ~N/2 = {N/2:.0f} predicted)")
+    print(f"  resolution rate       = {res_rate:.3f} "
+          f"({n_res_tot}/{n_elig_tot} eligible switches crossed before next)")
+    print(f"  mean fills            = {np.mean(fills_ct):.1f}")
+
+
+def exp3b_markov_integrated(p=P_PRIMARY, sigma=0.3, N=50, A=0.4, kappa=1.0,
+                            h_warmup=1.08, n_steps=4500, n_seeds=300):
+    """Exp3 — put the SAME estimator into the full k=.04 IntegratedMaker under
+    hidden Markov toxicity. Compare Toxicity-only (k=0) vs Integrated (k=.04),
+    same-seed CRN (same latent path, same price path). Estimator side + economic
+    side, both kept simple."""
+    def _metrics(r, schedule):
+        sf, ds = r["signed_flow"], r["delta_S"]
+        phi_hat = RollingToxicityEstimator(N, sigma).run_offline(sf, ds)
+        m = ~np.isnan(phi_hat)
+        rmse = np.sqrt(np.mean((phi_hat[m] - schedule[m]) ** 2))
+        seed_lags, n_res, n_elig = _switch_response_lags(phi_hat, schedule, sf, N)
+        pnl = r["pnl"][-1]
+        rms_inv = np.sqrt(np.mean(r["inventory"] ** 2))
+        fills = int((sf != 0).sum())
+        return rmse, seed_lags, n_res, n_elig, pnl, rms_inv, fills
+
+    keys = ("T", "IT")
+    rmse = {k: [] for k in keys}
+    lag = {k: [] for k in keys}
+    n_res = {k: 0 for k in keys}
+    n_elig = {k: 0 for k in keys}
+    pnl = {k: np.empty(n_seeds) for k in keys}
+    rms_inv = {k: [] for k in keys}
+    fills = {k: [] for k in keys}
+
+    for seed in range(n_seeds):
+        schedule = markov_schedule(n_steps, p, seed=seed)
+        makers = {
+            "T": AdaptiveMaker(N=N, sigma=sigma, h_warmup=h_warmup,
+                               kappa=kappa, k=0.0),
+            "IT": IntegratedMaker(k=0.04, N=N, sigma=sigma, h_warmup=h_warmup,
+                                  kappa=kappa, toxicity=True),
+        }
+        for kk in keys:
+            r = run(RandomWalk(sigma=sigma), makers[kk],
+                    RegimeInformedFlow(A=A, kappa=kappa, phi_schedule=schedule),
+                    n_steps=n_steps, seed=seed)
+            rm, seed_lags, nr, ne, pn, ri, fl = _metrics(r, schedule)
+            rmse[kk].append(rm)
+            lag[kk].extend(seed_lags)      # pool resolved transitions
+            n_res[kk] += nr
+            n_elig[kk] += ne
+            pnl[kk][seed] = pn
+            rms_inv[kk].append(ri)
+            fills[kk].append(fl)
+
+    print(f"\n=== Exp3b: same estimator inside full IntegratedMaker (Markov) ===")
+    print(f"  sigma={sigma}, p={p} (mean regime ~{1/p:.0f} ticks), N={N}, "
+          f"k=.04, n_seeds={n_seeds}")
+    print(f"  {'strategy':>16} {'phi_rmse':>9} {'lag_res':>8} {'res_rate':>9} "
+          f"{'mean_pnl':>9} {'rms_inv':>8} {'fills':>7}")
+    for kk, label in (("T", "Toxicity-only k=0"), ("IT", "Integrated k=.04")):
+        rr = n_res[kk] / n_elig[kk] if n_elig[kk] else float("nan")
+        pooled_lag = np.mean(lag[kk]) if lag[kk] else float("nan")
+        print(f"  {label:>16} {np.mean(rmse[kk]):>9.4f} "
+              f"{pooled_lag:>8.1f} {rr:>9.3f} {pnl[kk].mean():>9.2f} "
+              f"{np.mean(rms_inv[kk]):>8.3f} {np.mean(fills[kk]):>7.1f}")
+    d = pnl["IT"] - pnl["T"]
+    se = d.std(ddof=1) / np.sqrt(n_seeds)
+    print(f"  paired IT - T: mean={d.mean():+.3f}  se={se:.3f}  "
+          f"95%CI=[{d.mean()-1.96*se:+.3f}, {d.mean()+1.96*se:+.3f}]")
+
+
 if __name__ == "__main__":
-    exp3_interaction_economics()
+    exp2b_markov_tracking()
+    exp3b_markov_integrated()

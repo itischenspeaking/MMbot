@@ -176,6 +176,34 @@ def step_schedule(n_steps, breakpoints, values):
     return schedule
 
 
+def markov_schedule(n_steps, p, seed=0, phi_lo=0.0, phi_hi=1.0, start_hi=False):
+    """Two-state hidden Markov toxicity path phi_t in {phi_lo, phi_hi}.
+
+    Each tick switches state with probability p (mean regime length ~ 1/p),
+    so regime durations are geometric. The path is generated up front from
+    its OWN independent RNG (seeded here), then handed to RegimeInformedFlow
+    as a fixed phi_schedule array — exactly like step_schedule. This keeps
+    run()'s draw budget and CRN structure untouched: the latent path is
+    fixed data, not a fourth draw stream inside the loop, so the same seed
+    reproduces the same latent path and a single path can be fed to several
+    strategies for paired comparison.
+
+    latent randomness is isolated in `seed`; the market/flow/informed RNGs in
+    run() are unaffected.
+    """
+    if not 0.0 <= p <= 1.0:
+        raise ValueError("p must be in [0, 1]")
+    rng = np.random.default_rng(seed)
+    switches = rng.random(n_steps) < p     # switch[t]: does state flip at t?
+    schedule = np.empty(n_steps)
+    state = phi_hi if start_hi else phi_lo
+    for t in range(n_steps):
+        if switches[t]:
+            state = phi_hi if state == phi_lo else phi_lo
+        schedule[t] = state
+    return schedule
+
+
 class RegimeInformedFlow:
     """InformedFlow with phi varying over time via a fixed schedule.
 
