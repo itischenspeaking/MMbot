@@ -93,6 +93,7 @@ class RollingToxicityEstimator:
         self._scale = sigma * np.sqrt(2.0 / np.pi)  # m(phi=1)
         self.markouts = deque(maxlen=N)
         self._phi_hat = np.nan  # current estimate, carried across no-fill ticks
+        self._m_hat = np.nan    # raw windowed markout mean (v4c direct policy)
 
     def update(self, signed_flow, delta_S):
         """Advance one tick. Only fills (signed_flow != 0) update the window.
@@ -101,6 +102,7 @@ class RollingToxicityEstimator:
             self.markouts.append(signed_flow * delta_S)
             if len(self.markouts) == self.N:
                 m_hat = sum(self.markouts) / self.N
+                self._m_hat = m_hat
                 self._phi_hat = min(1.0, max(0.0, m_hat / self._scale))
         return self._phi_hat
 
@@ -112,6 +114,7 @@ class RollingToxicityEstimator:
         out = np.empty(len(signed_flow))
         self.markouts.clear()
         self._phi_hat = np.nan
+        self._m_hat = np.nan
         for t in range(len(signed_flow)):
             out[t] = self.update(signed_flow[t], delta_S[t])
         return out
@@ -257,3 +260,51 @@ class IntegratedMaker:
         the next tick onward. No-op when toxicity=False."""
         if self.toxicity:
             self.est.update(signed_flow, delta_S)
+
+
+class DirectMarkoutMaker:
+    """v4c: quote directly on estimated adverse markout, skipping phi.
+
+    The phi-based rule h = 1/kappa + phi_hat*sigma*sqrt(2/pi) with
+    phi_hat = clip(m_hat/(sigma*sqrt(2/pi)), 0, 1) is algebraically
+
+        h = 1/kappa + clip(m_hat, 0, sigma*sqrt(2/pi))
+
+    so sigma cancels except through the clip bounds. This maker acts on
+    m_hat directly. The `cap` switch isolates the one structural leftover
+    from the latent-phi parameterization — the phi<=1 upper cap:
+
+        cap=True :  h = 1/kappa + clip(m_hat, 0, sigma*sqrt(2/pi))
+                    (byte-identical to IntegratedMaker; regression, Exp1)
+        cap=False:  h = 1/kappa + max(m_hat, 0)
+                    (drops the inherited upper cap; Exp2)
+
+    Same center skew, warm-up, estimator, and timing as IntegratedMaker.
+
+      k, N, sigma, h_warmup, kappa : as IntegratedMaker
+      cap : keep the phi<=1 upper cap (True) or drop it (False)
+    """
+
+    def __init__(self, k, N, sigma, h_warmup, kappa=1.0, cap=True):
+        self.k = k
+        self.sigma = sigma
+        self.h_warmup = h_warmup
+        self.kappa = kappa
+        self.cap = cap
+        self._cap_val = sigma * np.sqrt(2.0 / np.pi)  # m(phi=1)
+        self.est = RollingToxicityEstimator(N, sigma)
+
+    def quote(self, S, inventory):
+        m_hat = self.est._m_hat  # from fills up to the previous tick
+        if np.isnan(m_hat):
+            h = self.h_warmup
+        else:
+            premium = max(m_hat, 0.0)
+            if self.cap:
+                premium = min(premium, self._cap_val)
+            h = 1.0 / self.kappa + premium
+        center = S - self.k * inventory
+        return center - h, center + h
+
+    def observe(self, signed_flow, delta_S):
+        self.est.update(signed_flow, delta_S)

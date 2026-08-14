@@ -6,7 +6,8 @@ from market import RandomWalk
 from simulator import (BernoulliFlow, QuoteSensitiveFlow, InformedFlow,
                        RegimeInformedFlow, step_schedule, markov_schedule, run)
 from strategy import (NaiveMaker, InventorySkewMaker, RollingToxicityEstimator,
-                      AdaptiveMaker, OracleMaker, IntegratedMaker, _h_star)
+                      AdaptiveMaker, OracleMaker, IntegratedMaker,
+                      DirectMarkoutMaker, _h_star)
 
 
 def sweep(n_seeds=500, n_steps=2000, sigma=0.1, half_spread=0.5, trade_prob=0.3):
@@ -1287,6 +1288,78 @@ def exp3b_markov_integrated(p=P_PRIMARY, sigma=0.3, N=50, A=0.4, kappa=1.0,
           f"95%CI=[{d.mean()-1.96*se:+.3f}, {d.mean()+1.96*se:+.3f}]")
 
 
+# --------------- v4c: from estimation to decision ---------------------------
+#
+# The phi-based rule is algebraically h = 1/kappa + clip(m_hat, 0, sigma*c),
+# so sigma cancels except through the clip bounds. Exp2 asks whether the
+# phi<=1 UPPER cap (the one structural leftover from the latent parameter)
+# actually matters economically, by comparing:
+#
+#   capped   (= current phi policy):  h = 1/kappa + clip(m_hat, 0, sigma*c)
+#   direct   (cap removed):           h = 1/kappa + max(m_hat, 0)
+#
+# on the k=.04 IntegratedMaker under the v4b hidden-Markov environment.
+
+def exp2c_cap_vs_direct(p=0.002, sigma=0.3, N=50, A=0.4, kappa=1.0,
+                        h_warmup=1.08, k=0.04, n_steps=4500, n_seeds=1000):
+    scale = sigma * np.sqrt(2.0 / np.pi)
+
+    pnl = {"cap": np.empty(n_seeds), "dir": np.empty(n_seeds)}
+    rms_inv = {"cap": [], "dir": []}
+    mean_h = {"cap": [], "dir": []}
+    binding_rates = []  # fraction of estimator observations with m_hat > cap
+
+    for seed in range(n_seeds):
+        schedule = markov_schedule(n_steps, p, seed=seed)
+        makers = {
+            "cap": DirectMarkoutMaker(k=k, N=N, sigma=sigma, h_warmup=h_warmup,
+                                      kappa=kappa, cap=True),
+            "dir": DirectMarkoutMaker(k=k, N=N, sigma=sigma, h_warmup=h_warmup,
+                                      kappa=kappa, cap=False),
+        }
+        for kk in ("cap", "dir"):
+            r = run(RandomWalk(sigma=sigma), makers[kk],
+                    RegimeInformedFlow(A=A, kappa=kappa, phi_schedule=schedule),
+                    n_steps=n_steps, seed=seed)
+            pnl[kk][seed] = r["pnl"][-1]
+            rms_inv[kk].append(np.sqrt(np.mean(r["inventory"] ** 2)))
+            mean_h[kk].append(((r["ask"] - r["bid"]) / 2.0).mean())
+
+        # upper-cap binding rate, measured on the capped run's own fill log
+        r_cap = run(RandomWalk(sigma=sigma),
+                    DirectMarkoutMaker(k=k, N=N, sigma=sigma, h_warmup=h_warmup,
+                                       kappa=kappa, cap=True),
+                    RegimeInformedFlow(A=A, kappa=kappa, phi_schedule=schedule),
+                    n_steps=n_steps, seed=seed)
+        est = RollingToxicityEstimator(N, sigma)
+        n_obs, n_bind = 0, 0
+        for sf_t, ds_t in zip(r_cap["signed_flow"], r_cap["delta_S"]):
+            # _m_hat here is the state the maker actually quoted this tick on
+            # (it quotes before observing markout_t). Count binding BEFORE the
+            # update, so the rate is the fraction of post-warmup DECISION ticks
+            # on which the upper cap binds the quote.
+            if not np.isnan(est._m_hat):
+                n_obs += 1
+                if est._m_hat > scale:
+                    n_bind += 1
+            est.update(sf_t, ds_t)
+        if n_obs:
+            binding_rates.append(n_bind / n_obs)
+
+    print(f"=== Exp2c: upper cap vs direct markout (Markov, k={k}) ===")
+    print(f"  sigma={sigma}, p={p}, N={N}, n_steps={n_steps}, n_seeds={n_seeds}")
+    print(f"  cap value sigma*sqrt(2/pi) = {scale:.4f}")
+    print(f"  upper-cap binding rate = {np.mean(binding_rates):.4f} "
+          f"(fraction of post-warmup decision ticks where cap binds the quote)")
+    print(f"  {'policy':>8} {'mean_pnl':>9} {'rms_inv':>8} {'mean_h':>7}")
+    for kk, label in (("cap", "capped"), ("dir", "direct")):
+        print(f"  {label:>8} {pnl[kk].mean():>9.2f} "
+              f"{np.mean(rms_inv[kk]):>8.3f} {np.mean(mean_h[kk]):>7.4f}")
+    d = pnl["dir"] - pnl["cap"]
+    se = d.std(ddof=1) / np.sqrt(n_seeds)
+    print(f"  paired direct - capped: mean={d.mean():+.3f}  se={se:.3f}  "
+          f"95%CI=[{d.mean()-1.96*se:+.3f}, {d.mean()+1.96*se:+.3f}]")
+
+
 if __name__ == "__main__":
-    exp2b_markov_tracking()
-    exp3b_markov_integrated()
+    exp2c_cap_vs_direct()
