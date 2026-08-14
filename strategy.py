@@ -197,3 +197,63 @@ class OracleMaker:
         h = _h_star(phi, self.kappa, self.sigma)
         center = S - self.k * inventory
         return center - h, center + h
+
+
+# --------------------------------------------------------------------------
+# v4pre: integrated baseline — v2's inventory skew + v3b's adaptive width,
+# wired into one maker. No new theory.
+# --------------------------------------------------------------------------
+
+class IntegratedMaker:
+    """v2 center-skew + v3b toxicity-adaptive width, combined.
+
+        center_t = S_t - k * q_t
+
+        warm-up (fewer than N fills observed):
+            h_t = h_warmup
+
+        after warm-up:
+            h_t = 1/kappa + phi_hat_t * sigma * sqrt(2/pi)     (lambda = 1)
+
+    h_warmup is a fallback used only before the estimator has N fills — once
+    phi_hat is defined the adaptive base is 1/kappa, not h_warmup. (An
+    earlier draft mistakenly kept using h_warmup as the base and added
+    phi_hat on top, double-counting the toxicity premium; fixed here.)
+
+    toxicity=False disables the adaptive width entirely: h_t = h_warmup for
+    every tick, the estimator is never updated, and the maker behaves as a
+    pure inventory-skew quoter. This exists only so k=0, toxicity=False
+    recovers a static maker exactly, and k>0, toxicity=False recovers v2's
+    InventorySkewMaker exactly — see sanity_v4.py regressions 2 and 3.
+
+      k          price shift per unit of inventory (v2)
+      N          estimator window, in fills (v3b)
+      sigma      known volatility
+      h_warmup   spread used before N fills, or always if toxicity=False
+      kappa      known flow decay
+      toxicity   if False, adaptive width is disabled (diagnostic/regression use)
+    """
+
+    def __init__(self, k, N, sigma, h_warmup, kappa=1.0, toxicity=True):
+        self.k = k
+        self.sigma = sigma
+        self.h_warmup = h_warmup
+        self.kappa = kappa
+        self.toxicity = toxicity
+        self.est = RollingToxicityEstimator(N, sigma) if toxicity else None
+
+    def quote(self, S, inventory):
+        if self.toxicity:
+            phi_hat = self.est._phi_hat  # from fills up to the previous tick
+            h = self.h_warmup if np.isnan(phi_hat) else _h_star(
+                phi_hat, self.kappa, self.sigma)
+        else:
+            h = self.h_warmup
+        center = S - self.k * inventory
+        return center - h, center + h
+
+    def observe(self, signed_flow, delta_S):
+        """Fold this tick's realized markout into the estimator, for use from
+        the next tick onward. No-op when toxicity=False."""
+        if self.toxicity:
+            self.est.update(signed_flow, delta_S)
