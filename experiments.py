@@ -1361,5 +1361,199 @@ def exp2c_cap_vs_direct(p=0.002, sigma=0.3, N=50, A=0.4, kappa=1.0,
           f"95%CI=[{d.mean()-1.96*se:+.3f}, {d.mean()+1.96*se:+.3f}]")
 
 
+# --------------- v4d: robustness & held-out generalization ------------------
+#
+# No new mechanism. The final policy is fixed except for one dev-tunable knob:
+#
+#     center_t = S_t - k*q_t
+#     h_t      = 1/kappa + lam * max(m_hat_t, 0)      (v4c direct-markout form)
+#
+# with k=.04, N=50, h_warmup=1.08 frozen; lam in {0.5, 1.0, 1.5} chosen on DEV.
+#
+# Discipline (the point of this chapter): seeds are split once, TEST is never
+# looked at before the policy is frozen. The whole block sits at 3000+, past
+# every seed range used in prior experiments (v3b/v4a used 0-2999), so v4d's
+# DEV/VALIDATION/TEST/STRESS are all genuinely fresh — TEST is truly held-out.
+#     DEV        seeds 3000-3499  lam selection by mean PnL
+#     VALIDATION seeds 3500-3999  confirm the dev winner once
+#     TEST       seeds 4000-6999  held-out 2x2 ablation, run once, after freeze
+#     STRESS     seeds 7000-7999  frozen IT vs I under harder environments
+
+DEV = range(3000, 3500)
+VALIDATION = range(3500, 4000)
+TEST = range(4000, 7000)
+LAM_GRID = (0.5, 1.0, 1.5)
+
+V4D_ENV = dict(sigma=0.3, A=0.4, kappa=1.0, p=0.002, n_steps=4500)
+
+
+def _final_maker(lam, k, N, sigma, h_warmup, kappa):
+    """Final v4d policy: uncapped direct-markout width (v4c result), lam knob."""
+    return DirectMarkoutMaker(k=k, N=N, sigma=sigma, h_warmup=h_warmup,
+                              kappa=kappa, cap=False, lam=lam)
+
+
+def _pnls_over_seeds(maker_fn, seeds, env):
+    sigma, A, kappa, p, n_steps = (env["sigma"], env["A"], env["kappa"],
+                                   env["p"], env["n_steps"])
+    pnl, rms = np.empty(len(seeds)), []
+    for i, seed in enumerate(seeds):
+        schedule = markov_schedule(n_steps, p, seed=seed)
+        r = run(RandomWalk(sigma=sigma), maker_fn(),
+                RegimeInformedFlow(A=A, kappa=kappa, phi_schedule=schedule),
+                n_steps=n_steps, seed=seed)
+        pnl[i] = r["pnl"][-1]
+        rms.append(np.sqrt(np.mean(r["inventory"] ** 2)))
+    return pnl, np.array(rms)
+
+
+def _ci(d):
+    m = d.mean()
+    se = d.std(ddof=1) / np.sqrt(len(d))
+    return m, se, m - 1.96 * se, m + 1.96 * se
+
+
+def _stress_metrics(compute_est, maker_fn, env, seeds, N, sigma):
+    """Run maker_fn over seeds; return (pnl, rms_inv, phi_rmse, resolution,
+    mean_fills). Estimator RMSE/resolution computed only when compute_est."""
+    A, kappa, p, n_steps = env["A"], env["kappa"], env["p"], env["n_steps"]
+    pnl = np.empty(len(seeds)); rms = []
+    rmses, all_lags, n_res, n_elig, fills_ct = [], [], 0, 0, []
+    for i, seed in enumerate(seeds):
+        schedule = markov_schedule(n_steps, p, seed=seed)
+        r = run(RandomWalk(sigma=sigma), maker_fn(),
+                RegimeInformedFlow(A=A, kappa=kappa, phi_schedule=schedule),
+                n_steps=n_steps, seed=seed)
+        pnl[i] = r["pnl"][-1]
+        rms.append(np.sqrt(np.mean(r["inventory"] ** 2)))
+        if compute_est:
+            sf, ds = r["signed_flow"], r["delta_S"]
+            phi_hat = RollingToxicityEstimator(N, sigma).run_offline(sf, ds)
+            mmask = ~np.isnan(phi_hat)
+            rmses.append(np.sqrt(np.mean((phi_hat[mmask] - schedule[mmask]) ** 2)))
+            lags, nr, ne = _switch_response_lags(phi_hat, schedule, sf, N)
+            all_lags.extend(lags); n_res += nr; n_elig += ne
+            fills_ct.append(int((sf != 0).sum()))
+    res = n_res / n_elig if n_elig else float("nan")
+    return (pnl, np.array(rms),
+            np.mean(rmses) if rmses else float("nan"),
+            res, np.mean(fills_ct) if fills_ct else float("nan"))
+
+
+def exp_v4d(N=50, k=0.04, h_warmup=1.08):
+    env = V4D_ENV
+    sigma, kappa = env["sigma"], env["kappa"]
+
+    # ---------- DEV: select lam by mean PnL ----------
+    print("=== v4d ===")
+    print(f"  env: {env}")
+    print(f"  DEV seeds {DEV.start}-{DEV.stop-1}: select lam in {LAM_GRID} "
+          f"by mean PnL")
+    dev_means = {}
+    for lam in LAM_GRID:
+        pnl, _ = _pnls_over_seeds(
+            lambda lam=lam: _final_maker(lam, k, N, sigma, h_warmup, kappa),
+            DEV, env)
+        dev_means[lam] = pnl.mean()
+        print(f"    lam={lam}: mean PnL = {pnl.mean():.2f}")
+    lam_star = max(dev_means, key=dev_means.get)
+    print(f"  DEV winner: lam* = {lam_star}")
+
+    # ---------- VALIDATION: confirm once ----------
+    print(f"  VALIDATION seeds {VALIDATION.start}-{VALIDATION.stop-1}:")
+    if lam_star != 1.0:
+        pnl_star, _ = _pnls_over_seeds(
+            lambda: _final_maker(lam_star, k, N, sigma, h_warmup, kappa),
+            VALIDATION, env)
+        pnl_one, _ = _pnls_over_seeds(
+            lambda: _final_maker(1.0, k, N, sigma, h_warmup, kappa),
+            VALIDATION, env)
+        m, se, lo, hi = _ci(pnl_star - pnl_one)
+        print(f"    P(lam*={lam_star}) - P(lam=1): mean={m:+.3f} se={se:.3f} "
+              f"95%CI=[{lo:+.3f}, {hi:+.3f}]")
+        if lo > 0:
+            lam_final = lam_star
+            print(f"    validation supports lam*={lam_star}; accept.")
+        else:
+            lam_final = 1.0
+            print(f"    validation does not clearly support it; revert to lam=1.")
+    else:
+        lam_final = 1.0
+        print(f"    dev winner is lam=1; no validation contest needed.")
+
+    # ---------- FREEZE ----------
+    print(f"  >>> FREEZE: final policy lam={lam_final}, k={k}, N={N}, "
+          f"h_warmup={h_warmup}. TEST opened once below. <<<")
+
+    # ---------- HELD-OUT TEST: 2x2 ablation ----------
+    print(f"  HELD-OUT TEST seeds {TEST.start}-{TEST.stop-1} "
+          f"({len(TEST)} seeds), 2x2 ablation:")
+
+    def cell(k_, adaptive):
+        if adaptive:
+            return lambda: _final_maker(lam_final, k_, N, sigma, h_warmup, kappa)
+        return lambda: InventorySkewMaker(half_spread=h_warmup, k=k_)
+
+    cells = {"F": cell(0.0, False), "I": cell(k, False),
+             "T": cell(0.0, True), "IT": cell(k, True)}
+    pnl, rms, maxabs, fills = {}, {}, {}, {}
+    for name, fn in cells.items():
+        sig, A, kap, p, ns = (env["sigma"], env["A"], env["kappa"],
+                              env["p"], env["n_steps"])
+        pp = np.empty(len(TEST)); rr = []; mx = []; fl = []
+        for i, seed in enumerate(TEST):
+            schedule = markov_schedule(ns, p, seed=seed)
+            r = run(RandomWalk(sigma=sig), fn(),
+                    RegimeInformedFlow(A=A, kappa=kap, phi_schedule=schedule),
+                    n_steps=ns, seed=seed)
+            pp[i] = r["pnl"][-1]
+            rr.append(np.sqrt(np.mean(r["inventory"] ** 2)))
+            mx.append(np.max(np.abs(r["inventory"])))
+            fl.append(r["n_trades"])
+        pnl[name], rms[name] = pp, np.array(rr)
+        maxabs[name], fills[name] = np.array(mx), np.array(fl)
+
+    print(f"  {'cell':>4} {'mean_pnl':>9} {'std_pnl':>8} {'p05':>8} "
+          f"{'rms_inv':>8} {'maxabs':>7} {'fills':>7}")
+    for name in ("F", "I", "T", "IT"):
+        print(f"  {name:>4} {pnl[name].mean():>9.2f} {pnl[name].std(ddof=1):>8.2f} "
+              f"{np.percentile(pnl[name], 5):>8.2f} {rms[name].mean():>8.3f} "
+              f"{maxabs[name].mean():>7.2f} {fills[name].mean():>7.1f}")
+
+    print(f"  paired effects (same-seed):")
+    for lbl, d in (("I - F", pnl["I"] - pnl["F"]),
+                   ("T - F", pnl["T"] - pnl["F"]),
+                   ("IT - I", pnl["IT"] - pnl["I"]),
+                   ("IT - T", pnl["IT"] - pnl["T"])):
+        m, se, lo, hi = _ci(d)
+        print(f"    {lbl:8} mean={m:+8.3f} se={se:6.3f} 95%CI=[{lo:+8.3f},{hi:+8.3f}]")
+    gamma = pnl["IT"] - pnl["I"] - pnl["T"] + pnl["F"]
+    m, se, lo, hi = _ci(gamma)
+    print(f"    gamma=IT-I-T+F  mean={m:+.3f} se={se:.3f} 95%CI=[{lo:+.3f},{hi:+.3f}]")
+
+    # ---------- STRESS: frozen IT vs I under harder environments ----------
+    print(f"  STRESS (frozen policy, IT vs I, 1000 fresh seeds each):")
+    stresses = {
+        "A: fast switch p=.004": {**env, "p": 0.004},
+        "B: high vol sigma=.4": {**env, "sigma": 0.4},
+        "C: low fill A=.25": {**env, "A": 0.25},
+    }
+    stress_seeds = range(7000, 8000)
+    for label, senv in stresses.items():
+        sig = senv["sigma"]
+        pnl_it, rms_it, rmse_it, res_it, fills_it = _stress_metrics(
+            True, lambda sig=sig: _final_maker(lam_final, k, N, sig, h_warmup, kappa),
+            senv, stress_seeds, N, sig)
+        pnl_i, rms_i, _, _, _ = _stress_metrics(
+            False, lambda: InventorySkewMaker(half_spread=h_warmup, k=k),
+            senv, stress_seeds, N, sig)
+        m, se, lo, hi = _ci(pnl_it - pnl_i)
+        print(f"    {label}:")
+        print(f"      IT-I mean={m:+.3f} se={se:.3f} 95%CI=[{lo:+.3f},{hi:+.3f}]  "
+              f"rms_inv I={rms_i.mean():.3f} IT={rms_it.mean():.3f}")
+        print(f"      IT estimator: RMSE={rmse_it:.4f} resolution={res_it:.3f} "
+              f"fills={fills_it:.0f}")
+
+
 if __name__ == "__main__":
-    exp2c_cap_vs_direct()
+    exp_v4d()

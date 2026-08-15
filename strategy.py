@@ -283,14 +283,17 @@ class DirectMarkoutMaker:
 
       k, N, sigma, h_warmup, kappa : as IntegratedMaker
       cap : keep the phi<=1 upper cap (True) or drop it (False)
+      lam : toxicity premium strength (v4d). h = 1/kappa + lam*premium.
+            lam=1 recovers the v4c policy exactly.
     """
 
-    def __init__(self, k, N, sigma, h_warmup, kappa=1.0, cap=True):
+    def __init__(self, k, N, sigma, h_warmup, kappa=1.0, cap=True, lam=1.0):
         self.k = k
         self.sigma = sigma
         self.h_warmup = h_warmup
         self.kappa = kappa
         self.cap = cap
+        self.lam = lam                                 # toxicity premium strength (v4d)
         self._cap_val = sigma * np.sqrt(2.0 / np.pi)  # m(phi=1)
         self.est = RollingToxicityEstimator(N, sigma)
 
@@ -302,7 +305,7 @@ class DirectMarkoutMaker:
             premium = max(m_hat, 0.0)
             if self.cap:
                 premium = min(premium, self._cap_val)
-            h = 1.0 / self.kappa + premium
+            h = 1.0 / self.kappa + self.lam * premium
         center = S - self.k * inventory
         return center - h, center + h
 
