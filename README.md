@@ -40,4 +40,4 @@ Edit the calls at the bottom of `experiments.py` to change what gets swept.
 - **v4a** — tests whether inventory and toxicity controls interfere with each other. They are approximately modular; inventory control also cuts the standard error of the toxicity treatment effect by about 77%. [Research Log](v4a_log.md)
 - **v4b** — replaces scripted toxicity with a hidden two-state Markov process. The same \(N=50\) estimator remains useful, with a clear finite-memory limit when regimes switch too quickly. [Research Log](v4b_log.md)
 - **v4c** — rewrites the quoting decision directly in terms of estimated adverse markout. Removing the intermediate \(\phi\) estimate and its upper cap leaves economic behavior essentially unchanged. [Research Log](v4c_log.md)
-- **v4d** — freezes the final policy and evaluates it on held-out seeds and pre-specified stress environments.
+- **v4d** — freezes the final policy and evaluates it on held-out seeds and pre-specified stress environments. The layered contributions reproduce on unseen data, and the frozen policy holds up across faster switching, higher volatility, and lower fill rates without re-tuning. [Research Log](v4d_log.md)

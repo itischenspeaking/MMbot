@@ -4,7 +4,7 @@
 
 V3b and V4b expressed adaptive quoting through a latent toxicity estimate:
 
-\[
+$$
 \hat{\phi}_t
 =
 \operatorname{clip}
@@ -12,23 +12,23 @@ V3b and V4b expressed adaptive quoting through a latent toxicity estimate:
 \frac{\hat{m}_t}{\sigma\sqrt{2/\pi}},
 0,1
 \right),
-\]
+$$
 
 followed by
 
-\[
+$$
 h_t
 =
 \frac{1}{\kappa}
 +
 \hat{\phi}_t \sigma\sqrt{2/\pi},
-\]
+$$
 
 where \(\hat m_t\) is the rolling estimate of adverse markout per fill.
 
 Substituting the estimator into the quoting rule gives
 
-\[
+$$
 h_t
 =
 \frac{1}{\kappa}
@@ -39,7 +39,7 @@ h_t
 0,
 \sigma\sqrt{2/\pi}
 \right).
-\]
+$$
 
 The normalization by \(\sigma\) therefore cancels when estimation is converted back into a decision.
 
@@ -71,7 +71,7 @@ Is the existing \(\phi\)-based quoting policy exactly equivalent to a direct-mar
 
 Given
 
-\[
+$$
 \hat{\phi}_t
 =
 \operatorname{clip}
@@ -79,21 +79,21 @@ Given
 \frac{\hat m_t}{\sigma\sqrt{2/\pi}},
 0,1
 \right),
-\]
+$$
 
 the existing policy
 
-\[
+$$
 h_t
 =
 \frac{1}{\kappa}
 +
 \hat{\phi}_t\sigma\sqrt{2/\pi}
-\]
+$$
 
 should be exactly equivalent to
 
-\[
+$$
 \boxed{
 h_t
 =
@@ -106,7 +106,7 @@ h_t
 \sigma\sqrt{2/\pi}
 \right)
 }
-\]
+$$
 
 provided that both implementations share the same rolling \(N=50\) markout history, warm-up rule, causal update timing, and clipping.
 
@@ -114,7 +114,7 @@ provided that both implementations share the same rolling \(N=50\) markout histo
 
 A direct-markout implementation was added using
 
-\[
+$$
 h_t
 =
 \frac{1}{\kappa}
@@ -125,7 +125,7 @@ h_t
 0,
 \sigma\sqrt{2/\pi}
 \right).
-\]
+$$
 
 Same-seed regression checks compared it against the existing \(\phi\)-based policy on:
 
@@ -148,17 +148,17 @@ The existing adaptive policy can be written directly in terms of estimated adver
 
 The only remaining structural difference is the upper cap implied by
 
-\[
+$$
 \phi \le 1,
-\]
+$$
 
 which becomes
 
-\[
+$$
 \hat m_t
 \le
 \sigma\sqrt{2/\pi}.
-\]
+$$
 
 ---
 
@@ -170,7 +170,7 @@ Once the explicit \(\phi\) parameterization is removed, does the inherited upper
 
 The capped policy is
 
-\[
+$$
 h_t
 =
 \frac{1}{\kappa}
@@ -181,11 +181,11 @@ h_t
 0,
 \sigma\sqrt{2/\pi}
 \right),
-\]
+$$
 
 while the uncapped direct policy is
 
-\[
+$$
 \boxed{
 h_t
 =
@@ -193,7 +193,7 @@ h_t
 +
 \max(\hat m_t,0)
 }
-\]
+$$
 
 The only difference is removal of the upper cap.
 
@@ -232,27 +232,27 @@ Primary metrics were:
 
 The upper-cap binding rate was defined as the fraction of post-warmup **decision ticks** for which
 
-\[
+$$
 \hat m_t
 >
 \sigma\sqrt{2/\pi}.
-\]
+$$
 
 At the baseline volatility,
 
-\[
+$$
 \sigma\sqrt{2/\pi}
 =
 0.2394.
-\]
+$$
 
 ### Results
 
 The upper cap bound on
 
-\[
+$$
 13.63\%
-\]
+$$
 
 of post-warmup decision ticks.
 
@@ -265,35 +265,35 @@ mean h           1.1170     1.1196
 
 Removing the cap increased average half-spread only slightly:
 
-\[
+$$
 1.1196 - 1.1170
 =
 0.0026.
-\]
+$$
 
 The paired terminal-PnL difference was
 
-\[
+$$
 Direct-Capped
 =
 -0.108,
-\]
+$$
 
 with
 
-\[
+$$
 SE
 =
 0.150,
-\]
+$$
 
 and
 
-\[
+$$
 95\%CI
 =
 [-0.401,\,+0.186].
-\]
+$$
 
 No economically detectable PnL difference was resolved, and inventory exposure was effectively unchanged.
 
@@ -305,7 +305,7 @@ The structural upper cap is active on a nontrivial fraction of decision ticks, y
 
 The simpler direct-markout rule is therefore sufficient:
 
-\[
+$$
 \boxed{
 h_t
 =
@@ -313,7 +313,7 @@ h_t
 +
 \max(\hat m_t,0)
 }
-\]
+$$
 
 The reason for preferring it is not higher PnL. The experiment does not support such a claim.
 
@@ -334,7 +334,7 @@ Removing the remaining structural upper cap also produces almost no economic cha
 
 The final quoting rule is therefore
 
-\[
+$$
 \boxed{
 h_t
 =
@@ -342,7 +342,7 @@ h_t
 +
 \max(\hat m_t,0)
 }
-\]
+$$
 
 which acts directly on estimated adverse-selection cost.
 

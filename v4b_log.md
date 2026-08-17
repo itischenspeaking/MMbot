@@ -4,9 +4,9 @@
 
 V3b introduced online toxicity estimation, but its environment was deliberately simple:
 
-\[
+$$
 \phi: 0 \rightarrow 1 \rightarrow 0.
-\]
+$$
 
 That deterministic schedule was useful for validating estimator response, but it made regime changes unusually clean and persistent.
 
@@ -18,15 +18,15 @@ The estimator is deliberately kept unchanged. The purpose of V4b is not to intro
 
 The hidden toxicity state becomes
 
-\[
+$$
 \phi_t \in \{0,1\},
-\]
+$$
 
 following a symmetric two-state Markov process:
 
-\[
+$$
 P(\phi_{t+1}\neq\phi_t)=p.
-\]
+$$
 
 Primary environment:
 
@@ -58,15 +58,15 @@ Can the deterministic toxicity schedule be replaced by a genuinely stochastic hi
 
 A symmetric two-state Markov process with
 
-\[
+$$
 p=0.002
-\]
+$$
 
 should generate persistent but randomly timed regimes, with expected duration
 
-\[
+$$
 E[L]=\frac{1}{p}=500
-\]
+$$
 
 ticks.
 
@@ -76,9 +76,9 @@ This should create a harder environment than V3b while still leaving enough time
 
 Generate
 
-\[
+$$
 \phi_t\in\{0,1\}
-\]
+$$
 
 using an independent Markov state process.
 
@@ -109,13 +109,13 @@ The V3b estimator was calibrated under long deterministic regimes. Does the same
 
 The estimator is unchanged:
 
-\[
+$$
 \hat m_t
 =
 \text{mean(last 50 filled markouts)},
-\]
+$$
 
-\[
+$$
 \hat\phi_t
 =
 \operatorname{clip}
@@ -123,7 +123,7 @@ The estimator is unchanged:
 \frac{\hat m_t}{\sigma\sqrt{2/\pi}},
 0,1
 \right).
-\]
+$$
 
 ### Hypothesis
 
@@ -134,9 +134,9 @@ Therefore:
 1. sufficiently persistent regimes should still be tracked;
 2. successful transitions should require approximately
 
-\[
+$$
 N/2 \approx 25
-\]
+$$
 
 new fills to cross the midpoint;
 3. some short regimes should end before the estimator finishes adapting.
@@ -165,10 +165,10 @@ Primary metrics:
 - response lag among resolved transitions;
 - resolution rate:
 
-\[
+$$
 \frac{\text{switches resolved before next switch}}
 {\text{eligible switches}}.
-\]
+$$
 
 Response lags are pooled across individual transitions so that every resolved transition carries equal weight.
 
@@ -263,49 +263,49 @@ mean PnL            626.97        589.94
 
 Estimator behavior is essentially unchanged:
 
-\[
+$$
 0.4010 \rightarrow 0.4003
-\]
+$$
 
 for RMSE,
 
-\[
+$$
 22.3 \rightarrow 22.4
-\]
+$$
 
 fills for response lag, and
 
-\[
+$$
 0.671 \rightarrow 0.677
-\]
+$$
 
 for transition-resolution rate.
 
 Meanwhile, RMS inventory falls from
 
-\[
+$$
 15.539 \rightarrow 3.455,
-\]
+$$
 
 a reduction of approximately `77.8%`.
 
 The paired PnL comparison is:
 
-\[
+$$
 IT-T=-37.030,
-\]
+$$
 
 with
 
-\[
+$$
 SE=18.485,
-\]
+$$
 
 and
 
-\[
+$$
 95\%CI=[-73.261,-0.800].
-\]
+$$
 
 This difference is reported honestly but is not used to reopen the inventory-cost analysis from V4a. The relevant V4b result is that the estimator and inventory-control mechanisms continue to function normally together.
 
