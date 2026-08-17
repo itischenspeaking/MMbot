@@ -24,77 +24,20 @@ Edit the calls at the bottom of `experiments.py` to change what gets swept.
 
 ## Versions
 
-**v0** — quotes S ± h and ignores everything else. Fills arrive at random and
-don't depend on the quote. Spread income is nearly deterministic; inventory
-random walks, earns nothing, and carries 98% of the variance. Both scale
-linearly in time, so risk-adjusted return doesn't improve however long the bot
-runs. [Log](v0_log.md)
+**v0** — baseline fixed-spread maker with random fills; establishes the P&L decomposition. Inventory carries almost all variance, so longer runs do not improve risk-adjusted return. [Research Log](v0_log.md)
 
-**v1** — fill probability decays with distance from fair value,
-p = A·exp(-kappa·distance), so quoting wider costs volume. An optimal
-half-spread appears at h* = 1/kappa, recovered by Monte Carlo across kappa; flow
-intensity A scales P&L without moving the optimum. The risk-adjusted best sits
-wider than the mean-P&L best. [Log](v1_log.md)
+**v1** — adds quote-sensitive fills, \(p=Ae^{-\kappa d}\), and the spread-volume trade-off. Monte Carlo recovers \(h^*=1/\kappa\); \(A\) scales P&L without moving the optimum. [Research Log](v1_log.md)
 
-**v2** — the quote center shifts against inventory, center = S − k·q, which
-only works now that flow responds to the quote (v0's flow couldn't feel it).
-RMS inventory falls steeply and cheaply at first — one small k cuts it 57% for
-a 0.4% P&L cost — with diminishing inventory returns and rising P&L cost as k
-grows further. RMS inventory at fixed k is exactly independent of sigma, as
-the model predicts; the best observed mean/std region shifts toward stronger
-skew as sigma rises. At sigma = 0, where inventory carries no price risk at
-all, mean/std still peaks at positive k — traced by exact P&L attribution to a
-negative correlation skew induces between baseline fill income and its own
-correction, not to any inventory-price effect. [Log](v2_log.md)
+**v2** — adds inventory skew, \(center=S-kq\). A small \(k\) sharply reduces inventory at modest mean-P&L cost; \(\sigma\) changes P&L risk but not the inventory path. [Research Log](v2_log.md)
 
-**v3a** — flow becomes single-trader-per-tick; with probability phi the trader
-sees sign(delta_S) and trades in that direction, otherwise picks a side by
-coin flip (fill probability unchanged either way). This decouples toxicity
-from volume — fill count stays flat across phi — so P&L changes trace cleanly
-to adverse selection. Signed one-step markout scales linearly in phi and
-matches sigma·√(2/π) to four significant figures at phi = 1. Inventory skew
-(v2) cuts RMS inventory by 88% without moving markout at all — inventory
-control and adverse-selection control are different problems. A coarse h
-sweep found no shift in the optimal spread; the predicted shift turned out to
-be ~0.08, under the grid spacing, so a fine grid with a quadratic peak fit was
-needed to see it — it tracks h*(phi) ≈ 1/κ + phi·σ·√(2/π) within 0.013 across
-six phi values. [Log](v3a_log.md)
+**v3a** — adds direction-informed toxic flow and signed one-step markout. Markout scales with toxicity, and the optimal half-spread shifts by \(\phi\sigma\sqrt{2/\pi}\) as predicted. [Research Log](v3a_log.md)
 
-**v3b** — phi becomes hidden and time-varying (schedule 0→1→0) instead of
-known and fixed. A rolling estimator inverts v3a's own calibration,
-phi_hat = clip(mean(last N fill markouts)/(sigma·√(2/π)), 0, 1), using only
-fills — no-fill ticks don't update it, and phi_hat is NaN until N fills
-accumulate. Response lag and steady-state noise both land almost exactly on
-their pre-registered predictions: lag ≈ N/2 fills (9.5/23.9/48.8 observed
-for N=20/50/100 against a ~10/25/50 prediction) and noise ∝ 1/√N. N=50 is
-the practical compromise. Feeding phi_hat into v3a's h_t = 1/κ +
-phi_hat·σ·√(2/π) makes an AdaptiveMaker that widens and narrows in the
-correct regimes, closing roughly 60–70% of the gap between a fixed spread
-and an oracle that knows phi_t exactly — but the available opportunity
-itself is small (~4 P&L over 4500 ticks), and k=0 inventory noise keeps the
-Adaptive-vs-Fixed P&L gain from clearing significance at 3000 seeds even
-though the oracle-vs-fixed gap does. [Log](v3b_log.md)
+**v3b** — hides time-varying toxicity and estimates it online from rolling filled markouts. \(N=50\) tracks regime changes in roughly \(N/2\) fills; adaptive quoting works, but its P&L benefit is small relative to inventory noise at \(k=0\). [Research Log](v3b_log.md)
 
-**v4** — v2 controls inventory, v3 controls toxicity, each in isolation; v4
-joins them and asks whether the combined policy generalizes past the one
-environment it was tuned on. v4 is long enough that it's organized as its
-own directory rather than one entry here: a [blueprint](v4_blueprint.md)
-lays out five sub-projects (v4pre, v4a, v4b, v4c, v4d), and each gets its
-own log as it completes. Still in progress — v4pre and v4a are done, v4b is
-in progress.
+**v4** — combines inventory and toxicity control, then tests interaction, simplification, and generalization. The [blueprint](v4_blueprint.md) splits the work into v4pre–v4d.
 
-- **v4pre** — inventory skew and toxicity-adaptive spread wired into one
-  bot (`IntegratedMaker`), with regression tests proving neither module's
-  behavior was corrupted. [Log](v4pre_log.md)
-- **v4a** — does inventory control and toxicity control complement or
-  fight each other? Answer: mostly neither — pricing interaction is small
-  and second-order, the toxicity estimator isn't contaminated by skew, and
-  the two controllers are roughly additive in PnL. The one big effect:
-  inventory control cuts the toxicity treatment effect's standard error by
-  ~77%, resolving a statistical ambiguity left open in v3b.
-  [Log](v4a_log.md)
-- **v4b** — online learning under randomly-switching (not scripted)
-  toxicity.
-- **v4c** — does the quote need separate phi/sigma estimates, or does the
-  observable markout alone suffice?
-- **v4d** — tune on a development set, evaluate once on held-out seeds.
+- **v4pre** — integrates inventory skew and toxicity-adaptive width into one maker. Inventory exposure falls sharply while the existing toxicity response survives integration. [Research Log](v4pre_log.md)
+- **v4a** — tests whether inventory and toxicity controls interfere with each other. They are approximately modular; inventory control also cuts the standard error of the toxicity treatment effect by about 77%. [Research Log](v4a_log.md)
+- **v4b** — replaces scripted toxicity with a hidden two-state Markov process. The same \(N=50\) estimator remains useful, with a clear finite-memory limit when regimes switch too quickly. [Research Log](v4b_log.md)
+- **v4c** — rewrites the quoting decision directly in terms of estimated adverse markout. Removing the intermediate \(\phi\) estimate and its upper cap leaves economic behavior essentially unchanged. [Research Log](v4c_log.md)
+- **v4d** — freezes the final policy and evaluates it on held-out seeds and pre-specified stress environments.
